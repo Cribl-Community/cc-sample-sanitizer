@@ -71,6 +71,24 @@ export function stripOuterQuotes(line: string): string {
   return line;
 }
 
+// Literal CEF at the START of the line (after trim/outer quotes). Syslog-framed
+// CEF (`<134>host CEF:0|…`) does NOT match — that still has a vendor envelope
+// the existing parsers can claim. A line that itself begins `CEF:<n>|` is the
+// wire format, not a guess at Device Vendor, so detection must return `cef`
+// and never lose to a coincidental datatype regex (Imperva/Infoblox/…).
+const CEF_LINE_PREFIX = /^CEF:\s*\d+\|/;
+
+export function sampleStartsWithCef(sampleEvents: string): boolean {
+  const lines = (sampleEvents || '')
+    .split('\n')
+    .map(l => stripOuterQuotes(l.trim()))
+    .filter(Boolean)
+    .slice(0, 40);
+  if (lines.length === 0) return false;
+  const hits = lines.filter(l => CEF_LINE_PREFIX.test(l)).length;
+  return hits >= Math.max(1, Math.ceil(lines.length * 0.6));
+}
+
 // Detect the structural envelope of a raw line and enumerate its field keys.
 export function extractSampleKeys(rawLines: string[]): { format: ExtractionCoverage['format']; keys: Set<string> } {
   const keys = new Set<string>();
@@ -345,6 +363,11 @@ const GOLDEN_SOURCE_EXPECTATIONS: Record<string, GoldenSourceExpectation> = {
   corelight_reporter: { format: 'json', keys: ['_path', 'ts'] },
   corelight_suricata_enriched: { format: 'json', keys: ['_path', 'ts'] },
   corelight_suricata_eve: { format: 'json', keys: ['_path', 'ts'] },
+  // Generic CEF has no vendor-specific keys to check — the fingerprint's own
+  // `cef` format classification (real `CEF:N|...` header) IS the expectation.
+  // Vendors with a richer dedicated parser (FortiGate, Zscaler, Check Point)
+  // declare their OWN kvp/cef expectation above and never fall through to this.
+  cef: { format: 'cef' },
 };
 
 /**
@@ -440,6 +463,19 @@ function matchesExpectation(expectation: GoldenSourceExpectation, sampleEvents: 
     allowed.has(fp.format) ||
     (allowed.has('kvp') && fp.format === 'cef') ||
     (allowed.has('cef') && fp.format === 'kvp');
+
+  // A genuine CEF header (`CEF:\d+\|...`) is self-describing evidence on its
+  // own — far stronger than the key-overlap heuristic below, which is tuned for
+  // each vendor's NATIVE kvp field names (FortiGate's `srcip`/`dstip`,
+  // checkpoint_firewall's `loguid`/`conn_direction`, ...) and almost never
+  // overlaps with the CEF Key Dictionary's OWN names (`src`/`dst`/`act`/...).
+  // Any vendor whose expectation permits cef (declared directly, via
+  // `alsoFormats`, or via the kvp<->cef leniency just above) gets a real CEF
+  // sample admitted outright — checkpoint_firewall's own richer parser now
+  // handles CEF too (see cefKeyDictionaryFunctions), so without this a genuine
+  // Check Point CEF export failed the KVP key-overlap check and silently fell
+  // to AI instead of that parser.
+  if (formatCompatible && fp.format === 'cef') return true;
 
   if (!formatCompatible) {
     // Format mismatch: e.g. sample is JSON but sourcetype expects kvp.
@@ -556,6 +592,15 @@ const SOURCETYPE_ALIASES: Record<string, string> = {
   cisco_ironport: 'cisco_esa',
   ironport: 'cisco_esa',
   esa: 'cisco_esa',
+  // checkpoint_firewall's own parser now handles real CEF too
+  // (cefKeyDictionaryFunctions, prepended in getParserForSourcetype) and its
+  // golden expectation admits a genuine CEF header outright (matchesExpectation
+  // — see the comment there). Keeping this alias ON checkpoint_firewall (not the
+  // generic `cef`) matters for a second reason: XSIAM has a DEDICATED, Palo
+  // Alto-validated T1a pipeline for Check Point specifically
+  // (config/xsiam-source-map.json's `checkpoint_firewall` entry lists
+  // `checkpoint_cef` as an alias) — routing this to bare `cef` would have
+  // resolved XSIAM to an unresolved T4 instead of that dedicated pipeline.
   checkpoint_cef: 'checkpoint_firewall',
   alibaba_actiontrail: 'alibaba_action_trail',
   action_trail: 'alibaba_action_trail',
@@ -716,6 +761,15 @@ const SOURCETYPE_ALIASES: Record<string, string> = {
   vmwarensx: 'vmware_nsx',
   ivantitop: 'ivanti_top',
   httpfpcmetadata: 'http_fpc_metadata',
+  // Generic, vendor-agnostic ArcSight/Micro Focus CEF (Common Event Format) —
+  // for a device that ships CEF with no dedicated vendor parser. checkpoint_cef
+  // (above) stays on checkpoint_firewall instead — see the comment on that alias.
+  generic_cef: 'cef',
+  arcsight_cef: 'cef',
+  common_event_format: 'cef',
+  micro_focus_cef: 'cef',
+  hpe_arcsight: 'cef',
+  arcsight_common: 'cef',
 };
 
 // Normalize a sourcetype so behavioral lookups (parser, drops, flags, mappings,
@@ -1475,6 +1529,7 @@ const SOURCETYPE_DESCRIPTIONS: Record<string, string> = {
   cisco_meraki: 'Cisco Meraki MX firewall syslog',
   duo_security: 'Duo Security authentication logs',
   carbonblack_edr: 'VMware Carbon Black EDR events',
+  cef: 'Generic ArcSight/Micro Focus CEF (Common Event Format) — vendor-agnostic',
 };
 
 export function describeSourcetype(sourcetypeRaw: string): string {
@@ -1714,6 +1769,17 @@ export function matchJsonSignature(sampleEvents: string): JsonSignatureMatch | n
 export function matchDatatypeParserBySample(sampleEvents: string): DatatypeSampleMatch | null {
   const rawLines = (sampleEvents || '').split('\n').map(l => l.trim()).filter(Boolean).slice(0, 40).map(stripOuterQuotes);
   if (rawLines.length === 0) return null;
+  if (sampleStartsWithCef(sampleEvents)) {
+    return {
+      parserKey: 'cef',
+      searchDatatypeId: '',
+      functions: cefKeyDictionaryFunctions(),
+      fields: getParserFieldNames('cef'),
+      confidence: 1,
+      method: 'regex',
+      runnersUp: [],
+    };
+  }
   const { keys } = extractSampleKeys(rawLines);
   const sampleKeysLc = new Set([...keys].map(k => k.toLowerCase()));
 
@@ -1923,6 +1989,153 @@ export const WINDOWS_CODE_FAMILY: ReadonlySet<string> = new Set<string>([
 /** True when a sourcetype is a Windows XML channel or PowerShell — code always allowed. */
 export function isWindowsCodeFamily(sourcetypeRaw: string): boolean {
   return WINDOWS_CODE_FAMILY.has(canonicalizeSourcetype(sourcetypeRaw));
+}
+
+/**
+ * The full ArcSight/Micro Focus CEF (Common Event Format) header + Key
+ * Dictionary extension parser — shared by the generic `cef` sourcetype AND by
+ * any vendor-specific case (checkpoint_firewall) whose devices can ALSO ship
+ * real CEF (`CEF:0|Vendor|...`) instead of, or alongside, their native format.
+ * Every stage is filter-guarded on real CEF markers (`CEF:\d+\|`, `signature_id`
+ * being set), so prepending this before a vendor's own native-format stages is
+ * always safe: on a non-CEF line every stage here is a no-op.
+ */
+function cefKeyDictionaryFunctions(): PipelineFunction[] {
+  return [
+    {
+      id: 'eval',
+      description: 'Strip outer quotes some forwarders wrap the whole line in',
+      conf: {
+        add: [
+          { name: '_raw', value: "_raw.length > 2 && _raw.charAt(0) == '\"' && _raw.charAt(_raw.length - 1) == '\"' ? _raw.slice(1, -1) : _raw" },
+        ],
+      },
+    },
+    {
+      id: 'regex_extract',
+      description: 'Extract the syslog envelope (priority, timestamp, device host) preceding the CEF marker, if present',
+      filter: '/^<\\d+>/.test(_raw) && /CEF:\\d+\\|/.test(_raw)',
+      conf: {
+        source: '_raw',
+        regex: '/^<(?<syslog_pri>\\d+)>(?:\\d\\s+)?(?<__env_ts>[A-Za-z]{3}\\s+\\d{1,2}\\s+[\\d:]{8}|\\d{4}-\\d{2}-\\d{2}T[\\d:.]+(?:Z|[+-]\\d{2}:?\\d{2})?)\\s+(?<device_host>\\S+)[^|]*?(?=CEF:)/',
+      },
+    },
+    {
+      id: 'regex_extract',
+      description: 'Extract the CEF header (version|vendor|product|version|signatureId|name|severity) and the extension tail',
+      filter: '/CEF:\\d+\\|/.test(_raw)',
+      conf: {
+        source: '_raw',
+        regex: '/CEF:(?<cef_version>\\d+)\\|(?<device_vendor>[^|]*)\\|(?<device_product>[^|]*)\\|(?<device_version>[^|]*)\\|(?<signature_id>[^|]*)\\|(?<name>[^|]*)\\|(?<severity_raw>[^|]*)\\|(?<__cef_ext>.*)$/',
+      },
+    },
+    {
+      id: 'eval',
+      description: 'Move the CEF extension into _raw for KVP extraction',
+      filter: 'typeof __cef_ext !== "undefined"',
+      conf: {
+        add: [
+          { name: '_raw', value: '__cef_ext' },
+        ],
+        remove: ['__cef_ext'],
+      },
+    },
+    {
+      id: 'serde',
+      description: 'Parse the CEF extension (space-delimited key=value pairs, per the CEF spec)',
+      filter: 'typeof signature_id !== "undefined"',
+      conf: { mode: 'extract', type: 'kvp', srcField: '_raw', cleanFields: true, allowedKeyChars: [], allowedValueChars: [] },
+    },
+    {
+      id: 'eval',
+      description: 'Alias custom fields (cs1-6/cn1-3) to their vendor-supplied Label when one is present',
+      filter: 'typeof signature_id !== "undefined"',
+      conf: {
+        // The field NAME is only known at runtime (it is the vendor's csNLabel
+        // value), so these are side-effect adds with an empty name — the same
+        // idiom the lookup-driven ASA parser uses. It must be
+        // `Object.assign(__e, {[name]: value})`, never `__e[name] = value`:
+        // Cribl's jsExpression validator rejects any assignment operator and
+        // fails the WHOLE pipeline PATCH with "Unallowed assignment operator
+        // found in expression" (verified against a live leader, build 779).
+        add: [
+          { name: '', value: "cs1Label && typeof cs1 !== 'undefined' ? Object.assign(__e, {[String(cs1Label).replace(/[^A-Za-z0-9_]/g,'_')]: cs1}) : undefined" },
+          { name: '', value: "cs2Label && typeof cs2 !== 'undefined' ? Object.assign(__e, {[String(cs2Label).replace(/[^A-Za-z0-9_]/g,'_')]: cs2}) : undefined" },
+          { name: '', value: "cs3Label && typeof cs3 !== 'undefined' ? Object.assign(__e, {[String(cs3Label).replace(/[^A-Za-z0-9_]/g,'_')]: cs3}) : undefined" },
+          { name: '', value: "cs4Label && typeof cs4 !== 'undefined' ? Object.assign(__e, {[String(cs4Label).replace(/[^A-Za-z0-9_]/g,'_')]: cs4}) : undefined" },
+          { name: '', value: "cs5Label && typeof cs5 !== 'undefined' ? Object.assign(__e, {[String(cs5Label).replace(/[^A-Za-z0-9_]/g,'_')]: cs5}) : undefined" },
+          { name: '', value: "cs6Label && typeof cs6 !== 'undefined' ? Object.assign(__e, {[String(cs6Label).replace(/[^A-Za-z0-9_]/g,'_')]: cs6}) : undefined" },
+          { name: '', value: "cn1Label && typeof cn1 !== 'undefined' ? Object.assign(__e, {[String(cn1Label).replace(/[^A-Za-z0-9_]/g,'_')]: Number(cn1)}) : undefined" },
+          { name: '', value: "cn2Label && typeof cn2 !== 'undefined' ? Object.assign(__e, {[String(cn2Label).replace(/[^A-Za-z0-9_]/g,'_')]: Number(cn2)}) : undefined" },
+          { name: '', value: "cn3Label && typeof cn3 !== 'undefined' ? Object.assign(__e, {[String(cn3Label).replace(/[^A-Za-z0-9_]/g,'_')]: Number(cn3)}) : undefined" },
+        ],
+      },
+    },
+    {
+      id: 'eval',
+      description: 'Normalize CEF header + extension dictionary keys to the canonical model',
+      filter: 'typeof signature_id !== "undefined"',
+      conf: {
+        add: [
+          // Source
+          { name: 'src_ip', value: 'src || undefined' },
+          { name: 'src_port', value: "typeof spt !== 'undefined' ? Number(spt) : undefined" },
+          { name: 'src_host', value: 'shost || undefined' },
+          { name: 'src_mac', value: 'smac || undefined' },
+          { name: 'src_user', value: 'suser || undefined' },
+          { name: 'src_zone', value: 'sourceZoneURI || undefined' },
+          { name: 'src_translated_ip', value: 'sourceTranslatedAddress || undefined' },
+          { name: 'src_translated_port', value: "typeof sourceTranslatedPort !== 'undefined' ? Number(sourceTranslatedPort) : undefined" },
+          // Destination
+          { name: 'dest_ip', value: 'dst || undefined' },
+          { name: 'dest_port', value: "typeof dpt !== 'undefined' ? Number(dpt) : undefined" },
+          { name: 'dest_host', value: 'dhost || undefined' },
+          { name: 'dest_mac', value: 'dmac || undefined' },
+          { name: 'dest_user', value: 'duser || undefined' },
+          { name: 'dest_zone', value: 'destinationZoneURI || undefined' },
+          { name: 'dest_translated_ip', value: 'destinationTranslatedAddress || undefined' },
+          { name: 'dest_translated_port', value: "typeof destinationTranslatedPort !== 'undefined' ? Number(destinationTranslatedPort) : undefined" },
+          // Connection / action
+          { name: 'transport', value: 'proto || undefined' },
+          { name: 'app', value: 'app || destinationServiceName || undefined' },
+          { name: 'protocol', value: 'app || undefined' },
+          { name: 'action', value: 'act || undefined' },
+          { name: 'category', value: 'cat || undefined' },
+          { name: 'outcome', value: 'outcome || undefined' },
+          { name: 'reason', value: 'reason || undefined' },
+          { name: 'bytes_in', value: "typeof __e['in'] !== 'undefined' ? Number(__e['in']) : undefined" },
+          { name: 'bytes_out', value: "typeof __e['out'] !== 'undefined' ? Number(__e['out']) : undefined" },
+          // Device / message
+          { name: 'device_ip', value: 'dvc || undefined' },
+          { name: 'device_host', value: 'dvchost || device_host || undefined' },
+          { name: 'message', value: 'msg || undefined' },
+          { name: 'request_url', value: 'request || undefined' },
+          { name: 'user_agent', value: 'requestClientApplication || undefined' },
+          { name: 'file_name', value: 'fname || undefined' },
+          { name: 'file_path', value: 'filePath || undefined' },
+          { name: 'file_hash', value: 'fileHash || undefined' },
+          { name: 'file_size', value: "typeof fsize !== 'undefined' ? Number(fsize) : undefined" },
+          // Identity
+          { name: 'event_code', value: 'signature_id || undefined' },
+          { name: 'signature', value: 'name || undefined' },
+          { name: 'session_id', value: 'externalId || undefined' },
+          { name: 'vendor', value: 'device_vendor || undefined' },
+          { name: 'product', value: 'device_product || undefined' },
+          { name: 'vendor_product', value: "String(device_vendor || '') + (device_vendor && device_product ? ' ' : '') + String(device_product || '')" },
+          { name: 'host', value: 'device_host || dvchost || shost || undefined' },
+          { name: 'user', value: 'suser || duser || undefined' },
+          // Severity: CEF allows a 0-10 integer OR the text Unknown/Low/Medium/High/Very-High
+          { name: 'severity', value: "/^\\d+$/.test(String(severity_raw)) ? Number(severity_raw) : (String(severity_raw).toLowerCase() == 'very-high' ? 10 : String(severity_raw).toLowerCase() == 'high' ? 8 : String(severity_raw).toLowerCase() == 'medium' ? 5 : String(severity_raw).toLowerCase() == 'low' ? 2 : String(severity_raw).toLowerCase() == 'unknown' ? 0 : undefined)" },
+          // Time: `rt` (Device Receipt Time) is CEF's canonical event timestamp —
+          // it outranks the syslog envelope's own time when both are present.
+          // Left in whatever scale it arrives (epoch seconds/ms or date text);
+          // the shared log_time -> _time epoch normalizer sorts out the scale.
+          { name: 'log_time', value: "typeof rt !== 'undefined' && rt !== '' ? rt : (typeof end !== 'undefined' && end !== '' ? Date.parse(end) : (typeof __env_ts !== 'undefined' ? Date.parse(/^[A-Za-z]{3}\\s/.test(__env_ts) ? __env_ts + ' ' + new Date().getFullYear() : __env_ts) : undefined))" },
+        ],
+        remove: ['__env_ts'],
+      },
+    },
+  ];
 }
 
 export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunctions: boolean): PipelineFunction[] {
@@ -2483,10 +2696,22 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
       ];
 
     case 'checkpoint_firewall':
+      // Check Point's Log Exporter can be configured to emit real CEF
+      // (`CEF:0|Check Point|...`) instead of its own KVP/syslog dialects — this
+      // used to fall through to the same legacy KVP parser below, which has NO
+      // branch that reads a literal `CEF:` header, so a CEF-configured export
+      // silently extracted nothing (event_code/src_ip/etc all undefined) despite
+      // `checkpoint_cef` implying CEF support. `cefKeyDictionaryFunctions()` goes
+      // FIRST and is a no-op on every stage when no CEF header is present, so a
+      // non-CEF Check Point sample still falls through unchanged to the legacy
+      // stages that follow (each explicitly gated on `signature_id` being unset,
+      // i.e. "CEF didn't match", so the two paths can never both fire).
       return [
+        ...cefKeyDictionaryFunctions(),
         {
           id: 'regex_extract',
           description: 'Extract RFC5424 syslog header and Check Point payload',
+          filter: 'typeof signature_id === "undefined"',
           conf: {
             source: '_raw',
             regex: '/^<(?<priority>\\d+)>(?<syslog_version>\\d+)\\s+(?<log_time>\\S+)\\s+(?<syslog_host>\\S+)\\s+(?<app_name>\\S+)\\s+(?<procid>\\S+)\\s+(?<msgid>\\S+)\\s+\\[(?<__kvp_body>.*)\\]$/',
@@ -2495,7 +2720,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
         {
           id: 'regex_extract',
           description: 'Extract legacy syslog header and KVP body',
-          filter: '!__kvp_body',
+          filter: 'typeof signature_id === "undefined" && !__kvp_body',
           conf: {
             source: '_raw',
             regex: '/^\\d+\\s+<\\d+>\\d+\\s+(?<log_time>\\S+)\\s+(?<syslog_host>\\S+)\\s+(?<__kvp_body>.*)/',
@@ -2504,25 +2729,25 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
         {
           id: 'serde',
           description: 'Parse semicolon-delimited Check Point KVP (key:"value")',
-          filter: '__kvp_body && String(__kvp_body).indexOf(";") >= 0',
+          filter: 'typeof signature_id === "undefined" && __kvp_body && String(__kvp_body).indexOf(";") >= 0',
           conf: { mode: 'extract', type: 'kvp', srcField: '__kvp_body', delimChar: '; ', pairDelim: ':', cleanFields: true },
         },
         {
           id: 'serde',
           description: 'Parse pipe-delimited Check Point KVP (key=value)',
-          filter: '__kvp_body && String(__kvp_body).indexOf(";") < 0',
+          filter: 'typeof signature_id === "undefined" && __kvp_body && String(__kvp_body).indexOf(";") < 0',
           conf: { mode: 'extract', type: 'kvp', srcField: '__kvp_body', delimChar: '|', cleanFields: true },
         },
         {
           id: 'serde',
           description: 'Parse inline semicolon KVP when no syslog wrapper matched',
-          filter: '!__kvp_body && String(_raw).indexOf(";") >= 0',
+          filter: 'typeof signature_id === "undefined" && !__kvp_body && String(_raw).indexOf(";") >= 0',
           conf: { mode: 'extract', type: 'kvp', srcField: '_raw', delimChar: '; ', pairDelim: ':', cleanFields: true },
         },
         {
           id: 'regex_extract',
           description: 'Extract BSD syslog header + KVP body (space-delimited key=value)',
-          filter: '!__kvp_body && !product',
+          filter: 'typeof signature_id === "undefined" && !__kvp_body && !product',
           conf: {
             source: '_raw',
             regex: '/^(?<__bsd_month>\\w{3})\\s+(?<__bsd_day>\\d+)\\s+(?<__bsd_time>[\\d:]+)\\s+(?<syslog_host>\\S+)\\s+(?<__kvp_body>.*)/',
@@ -2531,18 +2756,19 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
         {
           id: 'serde',
           description: 'Parse BSD syslog Check Point KVP (space-delimited key="value")',
-          filter: '__kvp_body && !product',
+          filter: 'typeof signature_id === "undefined" && __kvp_body && !product',
           conf: { mode: 'extract', type: 'kvp', srcField: '__kvp_body', delimChar: ' ', pairDelim: '=', quoteChar: '"', cleanFields: true },
         },
         {
           id: 'serde',
           description: 'Parse bare space-delimited key="value" (no syslog header matched)',
-          filter: '!__kvp_body && !product && String(_raw).indexOf("=") >= 0',
+          filter: 'typeof signature_id === "undefined" && !__kvp_body && !product && String(_raw).indexOf("=") >= 0',
           conf: { mode: 'extract', type: 'kvp', srcField: '_raw', delimChar: ' ', pairDelim: '=', quoteChar: '"', cleanFields: true },
         },
         {
           id: 'eval',
           description: 'Normalize Checkpoint fields to canonical model',
+          filter: 'typeof signature_id === "undefined"',
           conf: {
             add: [
               { name: 'src_ip', value: "src ? String(src).split(' ')[0] : srcaddr || undefined" },
@@ -2581,6 +2807,19 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
           },
         },
       ];
+
+    // Generic, vendor-agnostic ArcSight/Micro Focus CEF (Common Event Format).
+    // Unlike every other case in this switch, `cef` has no single vendor's field
+    // dictionary to hand-tune against — CEF's OWN spec is the contract, so the
+    // canonical aliases below follow the published CEF Key Dictionary verbatim
+    // (src/dst/spt/dpt/act/proto/app/cat/in/out/rt/cs1-6+Label/cn1-3+Label/...).
+    // Used directly for a device with no dedicated vendor parser, AND shared
+    // (via cefKeyDictionaryFunctions) by vendor cases whose own devices can also
+    // ship real CEF — FortiGate/Zscaler already fold their CEF variant into
+    // their own case via `alsoFormats`; checkpoint_firewall prepends this
+    // function set outright (see that case for why).
+    case 'cef':
+      return cefKeyDictionaryFunctions();
 
     case 'windows_powershell':
       return [
@@ -4050,6 +4289,39 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'bytes', 'bytes_in', 'bytes_out', 'src_translated_ip', 'dest_translated_ip',
         'src_translated_port', 'dest_translated_port',
         'app', 'vendor_product'];
+    case 'cef':
+      return [
+        // CEF header
+        'cef_version', 'device_vendor', 'device_product', 'device_version',
+        'signature_id', 'name', 'severity_raw',
+        // Raw CEF extension dictionary keys the kvp serde produces (a subset
+        // reaches output on any given real sample — Rule 12 excludes absent
+        // sample keys from the denominator, so listing the full dictionary here
+        // costs nothing but tells the mapping AI every key it might see).
+        'src', 'spt', 'shost', 'smac', 'suser', 'sourceZoneURI',
+        'sourceTranslatedAddress', 'sourceTranslatedPort',
+        'dst', 'dpt', 'dhost', 'dmac', 'duser', 'destinationZoneURI',
+        'destinationTranslatedAddress', 'destinationTranslatedPort', 'destinationServiceName',
+        'proto', 'app', 'act', 'cat', 'outcome', 'reason',
+        // Note: CEF's own extension keys for byte counts are literally `in`/`out`,
+        // which are JS reserved words — never declared bare (see bytes_in/bytes_out
+        // below); the parser reads them internally via bracket notation only.
+        'dvc', 'dvchost', 'msg', 'request', 'requestClientApplication',
+        'fname', 'filePath', 'fileHash', 'fsize', 'externalId', 'rt', 'start', 'end',
+        'cs1', 'cs2', 'cs3', 'cs4', 'cs5', 'cs6', 'cn1', 'cn2', 'cn3',
+        'cs1Label', 'cs2Label', 'cs3Label', 'cs4Label', 'cs5Label', 'cs6Label',
+        'cn1Label', 'cn2Label', 'cn3Label',
+        // Canonical aliases the eval stage derives
+        'src_ip', 'src_port', 'src_host', 'src_mac', 'src_user', 'src_zone',
+        'src_translated_ip', 'src_translated_port',
+        'dest_ip', 'dest_port', 'dest_host', 'dest_mac', 'dest_user', 'dest_zone',
+        'dest_translated_ip', 'dest_translated_port',
+        'transport', 'protocol', 'action', 'category', 'bytes_in', 'bytes_out',
+        'device_ip', 'device_host', 'message', 'request_url', 'user_agent',
+        'file_name', 'file_path', 'file_hash', 'file_size',
+        'event_code', 'signature', 'session_id', 'vendor', 'product', 'vendor_product',
+        'host', 'user', 'severity', 'log_time',
+      ];
     // Must stay in step with the apache/nginx case in getParserForSourcetype.
     // Without an explicit case these fell through to `default:` and declared the
     // SEARCH datatype's fields (clientip/request/remote_addr/time_local) while the
@@ -4144,5 +4416,10 @@ export const SOURCETYPE_DATACLASS: Record<string, DataClass> = {
   // Corelight subtypes that must beat the `/^corelight_/` → network pattern.
   corelight_ldap: 'authentication', corelight_ldap_search: 'authentication',
   corelight_http: 'web_proxy', corelight_smtp_links: 'email',
+  // CEF was designed for security devices (firewalls, IDS/IPS) and its own
+  // Key Dictionary is a 5-tuple network model (src/dst/spt/dpt/act/proto) —
+  // `network` gets a vendor-agnostic sample the golden CIM/OCSF Network spec
+  // that fits it best, rather than falling to 'generic' (which recommends json).
+  cef: 'network',
 };
 

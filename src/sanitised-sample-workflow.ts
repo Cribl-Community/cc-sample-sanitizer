@@ -12,6 +12,7 @@ import {
   matchGoldenSourceBySample,
   matchJsonSignature,
   recognizeSourcetype,
+  sampleStartsWithCef,
 } from './source-recognition';
 import {
   describeSampleFormat,
@@ -70,6 +71,18 @@ export interface LocalSampleRecognition {
 
 export function recogniseSampleLocally(events: string): LocalSampleRecognition {
   const format = describeSampleFormat(events.split('\n').filter(Boolean).slice(0, 50));
+  if (sampleStartsWithCef(events)) {
+    return {
+      sourcetype: 'cef',
+      display: 'cef',
+      method: 'static-parser',
+      confidence: 'high',
+      reason: 'The sample starts with a CEF header (CEF:<version>|…). Sourcetype is cef — the Device Vendor in the header is not guessed as a separate source.',
+      format,
+      offline: true,
+      alternatives: [],
+    };
+  }
   const match = matchDatatypeParserBySample(events);
   if (match) {
     const recognised = recognizeSourcetype(match.parserKey);
