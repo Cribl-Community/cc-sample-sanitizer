@@ -47,8 +47,8 @@ Licensed under Apache-2.0 — see `LICENSE`.
 
 ## Release notes
 
-- **0.3.x** — Review-and-apply reliability and a clearer sanitise step.
-  - **The wire format can never change.** Every replacement is now guaranteed to preserve the
+- **1.0.x (current)** — the sanitiser's stable feature set, published from the Cribl Pack Generator monorepo.
+  - **The wire format can never change.** Every replacement is guaranteed to preserve the
     line's structure — the count of tabs, pipes, commas, `=` and spaces is held constant, so a
     positional or delimited parser still splits the sample into the same fields it did before.
     A stand-in that would have shifted a boundary (a display name like `John Smith` collapsing to
@@ -56,18 +56,19 @@ Licensed under Apache-2.0 — see `LICENSE`.
     alias is created, not merely checked afterwards, so no identifier class can break the layout.
   - **A mis-recognised source no longer blocks a clean sample.** When a key-value/CEF log is
     matched to a positional parser, whole `key=value` chunks can land in address-named columns
-    (`src_ip = "quotePriority=NORMAL"`). The identity-coverage proof now recognises that an
+    (`src_ip = "quotePriority=NORMAL"`). The identity-coverage proof recognises that an
     address field holding a non-address value is a parse artefact, not a leaked identity, so it
     stops demanding the impossible while still holding real, unmasked IPs to account.
   - **Clearer sanitise step.** The masking choice is a single chip row — *Whole value* is
     selected by default, with one chip per detectable piece of the value — and the before/after
     panes are always visible side by side. When an identity does survive, the alert names the
     exact line and field so it can be fixed in one look.
-- **0.2.x** — Credential/secret pattern detection ships with the app as a public-source rule
-  library (gitleaks + Microsoft Presidio, both MIT, plus vendor-published token shapes). There is
-  no network call and no minimum platform version — a JWT, an AWS key pair, a connection URI's
-  password, a card number and an SSN are removed before a sample can be shared, on any supported
-  version. The rules are filtered before use (patterns that are only a character class and a length
-  are dropped so they can't rewrite field names) and scrambled character-for-character so length,
-  delimiters and structure survive.
-- **0.1.x** — Initial Marketplace release: file/paste/worker-group sample intake, identifier review, deterministic pseudonymisation, download, and per-worker-group shared sanitised-sample library.
+  - **Credential/secret pattern detection** ships with the app as a public-source rule
+    library (gitleaks + Microsoft Presidio, both MIT, plus vendor-published token shapes). There is
+    no network call and no minimum platform version — a JWT, an AWS key pair, a connection URI's
+    password, a card number and an SSN are removed before a sample can be shared, on any supported
+    version. The rules are filtered before use (patterns that are only a character class and a length
+    are dropped so they can't rewrite field names) and scrambled character-for-character so length,
+    delimiters and structure survive.
+  - **Core intake and sharing** — file/paste/worker-group sample intake, identifier review,
+    deterministic pseudonymisation, download, and a per-worker-group shared sanitised-sample library.

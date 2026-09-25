@@ -1,18 +1,40 @@
 {
-  "name": "sample-sanitizer",
-  "version": "1.0.258",
+  "name": "cc-sample-sanitizer",
+  "private": true,
+  "version": "1.0.259",
+  "buildNumber": 778,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "package": "npm run build && node scripts/package.mjs"
+  },
+  "dependencies": {
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.2",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "oxlint": "^1.71.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.1.1"
+  },
   "displayName": "Sample Sanitizer",
   "description": "Turn a real log sample into a shareable, de-identified sample — entirely on-box, with no AI. Select a file (or paste / pull worker-group events), review the detected identifiers, sanitise, then download or save to a shared per-worker-group sanitised-sample library. Built from the same sanitise engine as the Cribl Pack Generator.",
   "author": "Wilfred van der Linde - wlinde@cribl.io",
   "license": "Apache-2.0",
+  "cribl": {
+    "type": "app"
+  },
   "tags": {
     "product": [
       "stream",
       "edge"
     ]
-  },
-  "cribl": {
-    "type": "app",
-    "createAppScriptVersion": "0.2.0"
   }
 }
