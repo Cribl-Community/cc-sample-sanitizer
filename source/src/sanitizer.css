@@ -1,0 +1,35 @@
+/* Standalone Sample Sanitizer host chrome. The wizard brings its own sz-* styles
+   (from App.css), and the header reuses the Pack Generator's .hero-* banner classes
+   (also App.css). This file positions that banner in the full-page layout, restyles
+   the AI-Free badge, and — critically — undoes the Pack Generator's single-screen
+   viewport lock so the taller (hero + wizard) sanitizer page can scroll. */
+
+/* App.css locks the page to one non-scrolling screen for the Pack Generator
+   (`html, body, #root { height: 100% }` + `body { overflow: hidden }`). This file
+   loads ONLY in the sanitizer bundle, so overriding those here unlocks scrolling for
+   the sanitizer alone — without it the wizard footer sits below the fold unreachable. */
+html, body, #root { height: auto; min-height: 100%; overflow: visible; }
+body { overflow-y: auto; overflow-x: hidden; }
+
+.sanitizer-app { min-height: 100vh; background: #eef1f5; }
+
+/* Center the shared hero-banner on the same 1240px column the embedded wizard uses,
+   with breathing room above it (the banner's own margin-bottom spaces the wizard). */
+.sanitizer-hero {
+  width: min(1240px, 97vw);
+  margin: 24px auto 0;
+  flex-wrap: wrap;
+}
+
+/* AI-Free badge: same shape as .hero-badge, but green to signal "no AI / private"
+   instead of the Pack Generator's teal AI-Powered badge. */
+.sanitizer-badge {
+  background: linear-gradient(135deg, #2fb344, #1a9e5a);
+  box-shadow: 0 2px 4px rgba(26, 158, 90, 0.3);
+}
+
+/* The embedded wizard flows in normal document flow here (not a fixed overlay), so it
+   must not force an extra full viewport of height on top of the hero — otherwise the
+   page always overflows by the hero's height. Let it size to its content and grow. */
+.sz-overlay.sz-embedded { min-height: 0; }
+.sz-overlay.sz-embedded .sz-modal { max-height: none; }

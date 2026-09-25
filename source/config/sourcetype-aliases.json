@@ -1,0 +1,255 @@
+{
+  "$comment": [
+    "SINGLE SOURCE OF TRUTH for the sourcetype -> catalog-key alias map.",
+    "Consumed by BOTH src/bundled-data.ts (iframe) and scripts/reference-api.mjs (standalone backend).",
+    "These two used to hold hand-mirrored copies and DRIFTED: bundled-data was missing alibaba_action_trail",
+    "entirely, and still carried the buggy bare-`audit` alias that reference-api had already fixed — so the",
+    "same sourcetype resolved a different sample depending on run mode. Add aliases HERE only.",
+    "Values are catalog-key substrings, matched case-insensitively; order matters (richest/most-relevant first).",
+    "",
+    "`storeKeys` is a SECOND, different map: exact store keys — the samples pool manifest and config/ai-samples/.",
+    "It is deliberately NOT the substring map above — a store lookup is file equality, so a loose pattern",
+    "there would either silently miss or, worse, serve a neighbouring product's real log as if it were ours",
+    "(cisco_firepower's `ftd` pattern would hand back cisco_ftd.json). One entry per source, exact keys only,",
+    "and every entry states which real file it points at and why the two names are the same source."
+  ],
+  "$notes": {
+    "linux_audit": "NOT a bare 'audit' — that substring greedily matches 40+ unrelated catalog keys (cyberark sample-audit, slack/hubspot/openai/netskope audit logs) and there is NO real linux auditd sample in the catalog, so 'audit' could only ever resolve the WRONG source. (Bug: linux_audit pulled cyberark IDP JSON into a LinuxAudit_CIM pack.) Keep only precise, auditd-specific keys.",
+    "zscaler_web": "Precise: zscaler_web_logs is the real JSON web-transaction sample (20 events). A bare 'zscaler' also pulls ZPA/ZIA/firewall/LEEF variants that are NOT web proxy logs; keep it targeted so the web pack gets the web sample.",
+    "zscaler:nssweblog": "zscaler:nssweblog (Splunk NSS web-transaction sourcetype) IS the zscaler_web JSON format — point it at the same real 20-event sample rather than letting it fall to AI.",
+    "infoblox_dns": "DNS-specific — a bare 'infoblox' greedily matches dhcp/ntpd/leef/audit/etc.",
+    "corelight_conn": "Corelight/Zeek conn logs — target the cl_conn keys (20-event CL_Conn_300), NOT a bare 'corelight' (matches ccs_threat_info_corelight_notice, 1 event). Corelight is a commercial Zeek distro, so zeek_conn resolves the same sample."
+  },
+  "aliases": {
+    "cisco_asa": [
+      "cisco_asa",
+      "ciscoasa",
+      "cisco-asa"
+    ],
+    "cisco_ftd": [
+      "cisco_ftd",
+      "ftd_cleanup",
+      "cisco-ftd"
+    ],
+    "cisco_firepower": [
+      "firepower",
+      "cisco_ftd",
+      "ftd"
+    ],
+    "cisco_esa": [
+      "cisco_esa",
+      "esa",
+      "ironport"
+    ],
+    "palo_alto_traffic": [
+      "pan_traffic",
+      "palo_alto_traffic",
+      "pan-traffic",
+      "paloalto"
+    ],
+    "palo_alto_threat": [
+      "pan_threat",
+      "palo_alto_threat",
+      "pan-threat"
+    ],
+    "fortinet_fortigate": [
+      "fortigate",
+      "fortinet"
+    ],
+    "checkpoint_firewall": [
+      "checkpoint"
+    ],
+    "windows_powershell": [
+      "powershell",
+      "windows-powershell"
+    ],
+    "windows_security": [
+      "windows_security",
+      "wineventlog",
+      "windows-security",
+      "winevent"
+    ],
+    "windows_sysmon": [
+      "sysmon"
+    ],
+    "linux_syslog": [
+      "syslog-linux",
+      "linux_syslog",
+      "linux-syslog",
+      "syslog_linux"
+    ],
+    "linux_audit": [
+      "auditd",
+      "linux_audit",
+      "linux-audit"
+    ],
+    "crowdstrike_falcon": [
+      "crowdstrike",
+      "falcon",
+      "crwd"
+    ],
+    "aws_cloudtrail": [
+      "cloudtrail"
+    ],
+    "alibaba_action_trail": [
+      "alibaba_action_trail",
+      "alibaba_actiontrail",
+      "action_trail",
+      "actiontrail"
+    ],
+    "aws_vpc_flow": [
+      "vpc_flow",
+      "vpcflow"
+    ],
+    "azure_signin": [
+      "azure_signin",
+      "signin",
+      "entraid",
+      "azure_ad",
+      "azuread"
+    ],
+    "gcp_audit": [
+      "gcp",
+      "google_cloud_audit",
+      "googlecloud"
+    ],
+    "okta_system": [
+      "okta"
+    ],
+    "zscaler_web": [
+      "zscaler_web_logs",
+      "zscaler_web",
+      "zscaler_url"
+    ],
+    "zscaler:nssweblog": [
+      "zscaler_web_logs",
+      "zscaler_web",
+      "zscaler_url"
+    ],
+    "infoblox_dns": [
+      "infoblox-dns",
+      "infoblox_dns"
+    ],
+    "corelight_conn": [
+      "cl_conn_300",
+      "cl_conn"
+    ],
+    "zeek_conn": [
+      "cl_conn_300",
+      "cl_conn"
+    ],
+    "apache_access": [
+      "apache"
+    ],
+    "nginx_access": [
+      "nginx"
+    ],
+    "azure_ad_audit": [
+      "azure-ad-audit",
+      "azuread",
+      "AzureAD",
+      "XSIAM-Microsoft-AzureADAudit"
+    ],
+    "proofpoint_tap": [
+      "proofpoint_json_combined",
+      "proofpoint-json-multi",
+      "XSIAM-Proofpoint-TAP",
+      "proofpoint"
+    ],
+    "aws_guardduty": [
+      "guardduty",
+      "aws_guardduty"
+    ],
+    "kubernetes_audit": [
+      "kubernetes",
+      "k8s_audit",
+      "kube-audit"
+    ],
+    "suricata_ids": [
+      "suricata",
+      "suricata_ids",
+      "suricata-ids"
+    ],
+    "corelight_dns": [
+      "bro_dns_json",
+      "corelight_dns",
+      "zeek_dns"
+    ],
+    "corelight_http": [
+      "bro_http_json",
+      "corelight_http",
+      "zeek_http"
+    ],
+    "corelight_ssl": [
+      "bro_ssl_json",
+      "corelight_ssl",
+      "zeek_ssl"
+    ],
+    "corelight_weird": [
+      "bro_weird_json",
+      "corelight_weird",
+      "zeek_weird"
+    ],
+    "corelight_ntp": [
+      "bro_ntp_json",
+      "corelight_ntp",
+      "zeek_ntp"
+    ],
+    "corelight_software": [
+      "bro_loaded_scripts_json",
+      "bro_files_json",
+      "corelight_software"
+    ],
+    "cisco_meraki": [
+      "meraki",
+      "cisco_meraki",
+      "cisco-meraki"
+    ],
+    "duo_security": [
+      "duo",
+      "duo_security",
+      "duo-security"
+    ],
+    "carbonblack_edr": [
+      "carbonblack",
+      "carbon_black",
+      "cb_edr"
+    ],
+    "f5_bigip": [
+      "f5-ltm-syslog",
+      "bigip_syslog",
+      "f5-asm-syslog",
+      "f5-ltm-irule"
+    ]
+  },
+  "storeKeys": {
+    "ncsc_cloudflare_device_posture": "cloudflare_logpush_device_posture",
+    "ncsc_cloudflare_dns": "cloudflare_logpush_dns",
+    "ncsc_cloudflare_firewall": "cloudflare_logpush_firewall_event",
+    "ncsc_cloudflare_gateway_dns": "cloudflare_logpush_gateway_dns",
+    "ncsc_cloudflare_gateway_http": "cloudflare_logpush_gateway_http",
+    "ncsc_cloudflare_gateway_network": "cloudflare_logpush_gateway_network",
+    "ncsc_cloudflare_http": "cloudflare_logpush_http_request",
+    "ncsc_cloudflare_ztna": "cloudflare_logpush_access_request",
+    "mscs_azure_eventhub": "azure_eventhub",
+    "juniper_junos_firewall": "juniper_junos",
+    "aws_vpc_v5": "aws_vpcflow",
+    "aws_vpc_flow": "aws_vpcflow",
+    "aws_vpc_v2": "aws_vpcflow"
+  },
+  "$storeNotes": {
+    "ncsc_cloudflare_device_posture": "The customer census spells Cloudflare's Logpush device-posture feed with the collecting team's `ncsc_` prefix. cloudflare_logpush_device_posture.json holds the real PascalCase Logpush events for exactly that dataset — and until this alias existed the generated sample shadowed them, which is how a fabricated device-posture sample reached the review queue with a structure-only pass.",
+    "ncsc_cloudflare_dns": "Authoritative-DNS Logpush dataset. Same `ncsc_` prefix story as device_posture; all seven Cloudflare feeds below had a real Logpush fixture sitting unread on disk while a generated sample was promoted for the same source.",
+    "ncsc_cloudflare_firewall": "Logpush calls this dataset `firewall_event` (singular event), which is why the prefixed name misses it on an exact lookup.",
+    "ncsc_cloudflare_gateway_dns": "Zero Trust Gateway DNS queries — a different dataset from the authoritative-DNS one above, so the two aliases must stay separate.",
+    "ncsc_cloudflare_gateway_http": "Zero Trust Gateway HTTP requests — again distinct from the CDN `http_request` dataset below.",
+    "ncsc_cloudflare_gateway_network": "Zero Trust Gateway L4 network sessions.",
+    "ncsc_cloudflare_http": "The CDN/WAF request log; Logpush names the dataset `http_request`.",
+    "ncsc_cloudflare_ztna": "ZTNA is Cloudflare Access, whose Logpush dataset is `access_request` — the only mapping in this group inferred from the product name rather than a matching dataset name, so if the customer's ZTNA feed turns out to be gateway traffic rather than Access logins, this is the entry to re-check.",
+    "mscs_azure_eventhub": "`mscs_` is the collecting team's prefix for Microsoft Cloud Services; the feed itself is Azure Event Hub, whose real events are in azure_eventhub.json.",
+    "juniper_junos_firewall": "Junos firewall events are Junos syslog — juniper_junos.json is the same wire format. NOT juniper_srx: that is a specific platform's own sample and would silently substitute one product's log for another.",
+    "aws_vpc_v5": "Canonical parser name is aws_vpc_v5; the vendor-samples store key is aws_vpcflow (Elastic corpus spelling). Without this alias, batch rows for aws_vpc_v5 parked as 'Needs sample' while the real flow-log fixture sat unread.",
+    "aws_vpc_flow": "Alias form used in catalogs / CSV shorthand; same aws_vpcflow fixture as aws_vpc_v5.",
+    "aws_vpc_v2": "v2 layout still uses the same space-separated VPC Flow fixture for sample resolution; the parser case handles column differences."
+  }
+}

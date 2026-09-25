@@ -1,0 +1,37 @@
+# RBAC policy for the Sample Sanitizer app.
+#
+# Deliberately a strict subset of config/policies.yml (the Pack Generator's): the
+# sanitizer never creates packs, pipelines, datasets or dashboards. It only needs
+# to list worker groups, read/pull sample events, and read/write the shared
+# per-worker-group sanitised-sample library (`/m/*/system/samples`). No AI, so no
+# external-host proxies are declared for this app (see the note in
+# scripts/deploy-sanitizer.mjs).
+policies:
+  # List worker groups (the app's group selector).
+  - object: '/master/groups'
+    actions: ['GET']
+  # Connected-worker counts, so the live-capture picker can hide groups with no worker.
+  - object: '/master/workers'
+    actions: ['GET']
+  # Live-capture events from a worker group (one of the sample input sources).
+  - object: '/m/*/system/capture'
+    actions: ['POST']
+  # Shared sanitised-sample library: list + create.
+  - object: '/m/*/system/samples'
+    actions: ['GET', 'POST']
+  # Shared sanitised-sample library: read metadata, update-by-id, delete.
+  - object: '/m/*/system/samples/*'
+    actions: ['GET', 'PATCH', 'DELETE']
+  # Fetch a sample's events.
+  - object: '/m/*/system/samples/*/content'
+    actions: ['GET']
+  # Read-only pack sample discovery: the sample picker also searches samples that live
+  # inside packs installed in the selected worker group. These are strictly READ (GET) —
+  # the sanitizer lists packs, lists each pack's samples, and reads a chosen sample's
+  # events. It never creates, updates or deletes anything inside a pack.
+  - object: '/m/*/packs'
+    actions: ['GET']
+  - object: '/m/*/p/*/system/samples'
+    actions: ['GET']
+  - object: '/m/*/p/*/system/samples/*/content'
+    actions: ['GET']
