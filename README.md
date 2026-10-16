@@ -35,11 +35,11 @@ After install, an admin must grant open access (**Apps → Sample Sanitizer → 
 
 ## Contributing
 
-The app is a build target of the Cribl Pack Generator monorepo. Issues and pull requests are welcome via the source repository; please keep the sanitise engine AI-free and network-free (both are enforced by automated tests).
+Issues and pull requests are welcome in this repository. It is generated from the Cribl Pack Generator's development repository, so a maintainer ports an accepted change there and it ships in the next release. See [CONTRIBUTING.md](CONTRIBUTING.md). `npm test` runs the bundled tests, including the ones that keep the sanitise engine AI-free.
 
 ## Support
 
-Built and maintained by Wilfred van der Linde (Cribl SE). For issues, reach out via the source repository or your Cribl contact.
+Built and maintained by Wilfred van der Linde (Cribl SE). For issues, open one in this repository.
 
 ## License
 
