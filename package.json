@@ -1,7 +1,7 @@
 {
   "name": "cc-sample-sanitizer",
   "private": true,
-  "version": "1.0.263",
+  "version": "1.0.264",
   "buildNumber": 778,
   "type": "module",
   "scripts": {
@@ -28,7 +28,7 @@
   },
   "displayName": "Sample Sanitizer",
   "description": "Turn a real log sample into a shareable, de-identified sample — entirely on-box, with no AI. Select a file (or paste / pull worker-group events), review the detected identifiers, sanitise, then download or save to a shared per-worker-group sanitised-sample library. Built from the same sanitise engine as the Cribl Pack Generator.",
-  "author": "Wilfred van der Linde - fakeuser@cribl.io",
+  "author": "Wilfred van der Linde - wlinde@cribl.io",
   "license": "Apache-2.0",
   "cribl": {
     "type": "app"
