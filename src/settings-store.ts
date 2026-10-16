@@ -8,7 +8,9 @@
 // enforced by tests/sanitizer-ai-free-test.mjs).
 import { getRunMode } from './run-mode';
 
-export type AiProvider = 'anthropic' | 'bedrock' | 'openai' | 'mistral' | 'azureai' | 'gemini' | 'devproxy';
+// 'cribl' = the org's own Cribl AI Settings (BYOM or Cribl-managed), reached through
+// the platform's open_investigator agent. App (iframe) mode only; no key of our own.
+export type AiProvider = 'anthropic' | 'bedrock' | 'openai' | 'mistral' | 'azureai' | 'gemini' | 'devproxy' | 'cribl';
 
 export interface AiSettings {
   provider: AiProvider;
@@ -74,7 +76,7 @@ export function canBackgroundUseProvider(provider: AiProvider): { ok: boolean; r
       reason: 'Direct Bedrock credentials cannot be used by background workers. Choose Aperture or an app-proxied provider.',
     };
   }
-  if (!['anthropic', 'openai', 'mistral', 'azureai', 'gemini', 'devproxy'].includes(provider)) {
+  if (!['anthropic', 'openai', 'mistral', 'azureai', 'gemini', 'devproxy', 'cribl'].includes(provider)) {
     return { ok: false, reason: `Unknown AI provider "${String(provider)}" in background snapshot.` };
   }
   return { ok: true };
@@ -281,59 +283,106 @@ function setCookie(name: string, value: string) {
   } catch { /* ignore */ }
 }
 
-// --- Platform REST persistence (iframe fallback when localStorage unavailable) ---
-// Uses Cribl's global variables endpoint to persist settings across sessions.
-// Global vars live at /lib/vars and survive deployments/restarts.
+// --- Platform persistence (the copy that survives a browser that drops iframe storage) ---
+// Inside Cribl's iframe, localStorage and cookies are third-party storage: Safari,
+// Brave, strict Firefox, Chrome with third-party cookies blocked and incognito drop
+// them, so for those users the settings lived in memory only (2026-10-08 report).
+// The durable copy is the app's own KV store, the store the sample library and
+// goldens already use: no worker group, no commit, readable by anyone who can open
+// the app. Secrets never go here (persistable*Settings blanks them; they stay in
+// encrypted KV). The old /m/default/lib/vars variable is read once to migrate: its
+// save never created the variable (a 404 is not a network error), and it needed a
+// `default` group the user could edit.
+export const SETTINGS_KV_KEY = 'settings/app';
 const SETTINGS_VAR_ID = 'pack_generator_settings';
 let platformSettingsCache: Record<string, any> | null = null;
 let platformSettingsLoaded = false;
 
+type SettingsFetch = (url: string, init?: RequestInit) => Promise<Response>;
+let settingsFetch: SettingsFetch = (url, init) => fetch(url, init);
+let settingsBaseOverride: string | null = null;
+
 function getCriblApiBase(): string {
+  if (settingsBaseOverride != null) return settingsBaseOverride;
   const fromWindow = typeof window !== 'undefined' ? (window as any).CRIBL_API_URL : undefined;
   if (fromWindow && fromWindow.length > 0) return fromWindow.replace(/\/+$/, '');
   return '/api/v1';
 }
+const platformEnabled = () => settingsBaseOverride != null || getRunMode() === 'iframe';
+
+// A KV GET can come back as the document, as a JSON string of it, or wrapped in items[0].value.
+function parseStoredBlob(text: string): Record<string, any> | null {
+  let v: any = text;
+  for (let i = 0; i < 3 && typeof v === 'string'; i++) {
+    if (!v.trim()) return null;
+    try { v = JSON.parse(v); } catch { return null; }
+  }
+  if (v && typeof v === 'object' && Array.isArray(v.items)) v = v.items[0]?.value ?? null;
+  if (typeof v === 'string') { try { v = JSON.parse(v); } catch { return null; } }
+  return v && typeof v === 'object' && !Array.isArray(v) ? v : null;
+}
+
+async function putSettingsKv(blob: Record<string, any>): Promise<void> {
+  // text/plain: a JSON content-type PUT is stored as "[object Object]".
+  const resp = await settingsFetch(`${getCriblApiBase()}/kvstore/${SETTINGS_KV_KEY}`, {
+    method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify(blob),
+  });
+  if (!resp.ok) throw new Error(`Settings save failed (${resp.status})`);
+}
 
 async function loadPlatformSettings(): Promise<Record<string, any> | null> {
   if (platformSettingsLoaded) return platformSettingsCache;
-  if (getRunMode() !== 'iframe') { platformSettingsLoaded = true; return null; }
+  if (!platformEnabled()) { platformSettingsLoaded = true; return null; }
   try {
-    // Use /m/default/lib/vars — worker-group scoped (Cloud requires group prefix)
-    const resp = await fetch(`${getCriblApiBase()}/m/default/lib/vars/${SETTINGS_VAR_ID}`, {
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (!resp.ok) { platformSettingsLoaded = true; return null; }
-    const data = await resp.json();
-    const item = data.items?.[0] || data;
-    if (item?.value) {
-      platformSettingsCache = typeof item.value === 'string' ? JSON.parse(item.value) : item.value;
-      platformSettingsLoaded = true;
-      return platformSettingsCache;
-    }
-  } catch { /* ignore */ }
+    const resp = await settingsFetch(`${getCriblApiBase()}/kvstore/${SETTINGS_KV_KEY}`);
+    if (resp.ok) platformSettingsCache = parseStoredBlob(await resp.text());
+  } catch { /* unreachable — try the legacy variable */ }
+  if (!platformSettingsCache) {
+    try {
+      const resp = await settingsFetch(`${getCriblApiBase()}/m/default/lib/vars/${SETTINGS_VAR_ID}`);
+      if (resp.ok) {
+        const data = await resp.json();
+        const item = data.items?.[0] || data;
+        const legacy = item?.value ? parseStoredBlob(typeof item.value === 'string' ? item.value : JSON.stringify(item.value)) : null;
+        if (legacy) { platformSettingsCache = legacy; await putSettingsKv(legacy).catch(() => {}); }
+      }
+    } catch { /* no legacy copy */ }
+  }
   platformSettingsLoaded = true;
-  return null;
-}
-
-function savePlatformSettings(allSettings: Record<string, any>) {
-  if (getRunMode() !== 'iframe') return;
-  platformSettingsCache = allSettings;
-  fetch(`${getCriblApiBase()}/m/default/lib/vars/${SETTINGS_VAR_ID}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id: SETTINGS_VAR_ID, type: 'string', value: JSON.stringify(allSettings), description: 'Pack Generator app settings (auto-managed)' }),
-  }).catch(() => {
-    // If PATCH fails (var doesn't exist yet), try POST to create it
-    fetch(`${getCriblApiBase()}/m/default/lib/vars`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: SETTINGS_VAR_ID, type: 'string', value: JSON.stringify(allSettings), description: 'Pack Generator app settings (auto-managed)' }),
-    }).catch(() => { /* best-effort */ });
-  });
+  return platformSettingsCache;
 }
 
 // Eagerly load platform settings on module init (non-blocking)
-const platformReady = loadPlatformSettings();
+let platformReady = loadPlatformSettings();
+let platformWrites: Promise<void> = Promise.resolve();
+
+/**
+ * Merge `patch` into the stored blob and write it. Waits for the initial load, so a
+ * save made before it finished cannot overwrite the other half (AI vs quality) with
+ * nothing; writes are chained so the last save wins.
+ */
+function savePlatformSettings(patch: Record<string, any>): Promise<void> {
+  if (!platformEnabled()) return Promise.resolve();
+  platformSettingsCache = { ...platformSettingsCache, ...patch };
+  platformWrites = platformWrites
+    .then(() => platformReady)
+    .then(() => { platformSettingsCache = { ...platformSettingsCache, ...patch }; return putSettingsKv(platformSettingsCache); })
+    .catch(() => { /* best-effort: localStorage/cookie still hold it where the browser allows */ });
+  return platformWrites;
+}
+
+/** Tests: point the platform copy at a fake KV and reload it, as a fresh app start would. */
+export function setSettingsKvTransportForTests(f: SettingsFetch, base: string): Promise<void> {
+  settingsFetch = f; settingsBaseOverride = base;
+  platformSettingsCache = null; platformSettingsLoaded = false;
+  memorySettings = null; memoryQuality = null;
+  platformReady = loadPlatformSettings();
+  platformWrites = Promise.resolve();
+  return platformReady.then(() => {});
+}
+
+/** Tests: resolves once every queued platform write has landed. */
+export const platformSettingsFlushed = (): Promise<void> => platformWrites;
 
 export function loadSettings(): AiSettings {
   if (memorySettings) return memorySettings;
@@ -460,10 +509,7 @@ export function persistDurableAiSettings(s: AiSettings): void {
       }
     },
     cookie: serialized => setCookie(STORAGE_KEY, serialized),
-    platform: serialized => savePlatformSettings({
-      ...platformSettingsCache,
-      aiSettings: JSON.parse(serialized),
-    }),
+    platform: serialized => { savePlatformSettings({ aiSettings: JSON.parse(serialized) }); },
   });
 }
 
@@ -553,13 +599,20 @@ export interface QualitySettings {
    * uploaded, worker-group, pasted and live-captured events are customer data that may
    * not reach a model vendor. With this on, the wizard's AI steps stop and say why until
    * the sample has been pseudonymised locally (see sample-sanitise.ts) — it stops being
-   * something a reviewer has to remember. Defaults ON, because the safe default for
-   * customer data is not to send it.
+   * something a reviewer has to remember. Defaults OFF; a deployment opts in with
+   * VITE_REQUIRE_SANITISED_SAMPLES=true, or the user turns it on in Settings.
    *
    * It governs THIRD-PARTY providers only. The Cribl Copilot schematizer talks to the
    * user's own Cribl org, which is a different question from handing data to OpenAI.
    */
   requireSanitisedSamples: boolean;
+  /**
+   * Drop null and blank ('') fields when a Parser (serde) parses JSON: the build
+   * sets the Parser's `fieldFilterExpr` to `value!=null && value!==''`, which
+   * keeps 0 and false. Cribl applies the filter to top-level fields only.
+   * Defaults OFF; scoring is unaffected (null/blank already count as unfilled).
+   */
+  dropEmptyJsonFields: boolean;
 }
 
 const QUALITY_STORAGE_KEY = 'pack-generator-quality-settings';
@@ -609,6 +662,7 @@ function getDefaultQualitySettings(): QualitySettings {
     // gate is off by default; turn it on in Settings to force it. Set
     // VITE_REQUIRE_SANITISED_SAMPLES=true to default it on for a build.
     requireSanitisedSamples: viteEnv('VITE_REQUIRE_SANITISED_SAMPLES') === 'true',
+    dropEmptyJsonFields: false,
   };
 }
 
@@ -719,10 +773,7 @@ export function saveQualitySettings(s: QualitySettings) {
       }
     },
     cookie: serialized => setCookie(QUALITY_STORAGE_KEY, serialized),
-    platform: serialized => savePlatformSettings({
-      ...platformSettingsCache,
-      qualitySettings: JSON.parse(serialized),
-    }),
+    platform: serialized => { savePlatformSettings({ qualitySettings: JSON.parse(serialized) }); },
   });
   memoryQuality = {
     ...s,

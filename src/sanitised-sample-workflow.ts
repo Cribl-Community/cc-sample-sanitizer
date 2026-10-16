@@ -11,8 +11,8 @@ import {
   matchDatatypeParserBySample,
   matchGoldenSourceBySample,
   matchJsonSignature,
+  recognizeCefSource,
   recognizeSourcetype,
-  sampleStartsWithCef,
 } from './source-recognition';
 import {
   describeSampleFormat,
@@ -71,13 +71,16 @@ export interface LocalSampleRecognition {
 
 export function recogniseSampleLocally(events: string): LocalSampleRecognition {
   const format = describeSampleFormat(events.split('\n').filter(Boolean).slice(0, 50));
-  if (sampleStartsWithCef(events)) {
+  // Format first: a CEF sample names its source in the header (see
+  // recognizeCefSource) — read, never guessed by a vendor datatype regex.
+  const cefSource = recognizeCefSource(events);
+  if (cefSource) {
     return {
-      sourcetype: 'cef',
-      display: 'cef',
+      sourcetype: cefSource.sourcetype,
+      display: cefSource.sourcetype,
       method: 'static-parser',
       confidence: 'high',
-      reason: 'The sample starts with a CEF header (CEF:<version>|…). Sourcetype is cef — the Device Vendor in the header is not guessed as a separate source.',
+      reason: cefSource.reason,
       format,
       offline: true,
       alternatives: [],
@@ -217,9 +220,11 @@ export function recogniseSampleLocally(events: string): LocalSampleRecognition {
  * Order, strongest-first:
  *   1. A confirmed/entered sourcetype whose static parser exists (the wizard's
  *      strength — the pack-gen flow almost always has this).
- *   2. A direct datatype-parser content match (`matchDatatypeParserBySample`),
+ *   2. The sample's own CEF header (`recognizeCefSource`) — the format decides
+ *      before any content regex is tried.
+ *   3. A direct datatype-parser content match (`matchDatatypeParserBySample`),
  *      which returns the parser functions even when no static parser is registered.
- *   3. The full-catalogue local recogniser (`recogniseSampleLocally`, breadth +
+ *   4. The full-catalogue local recogniser (`recogniseSampleLocally`, breadth +
  *      richness thresholds) — this is what lets the LIBRARY flow, which starts
  *      from a cold paste with no sourcetype, still find a parser.
  * Every tier is local: nothing here reaches AI or the network (Hard Rule 23).
@@ -236,6 +241,13 @@ export function resolveSanitiseSourcetype(
   const name = String(hint || '').trim();
   if (name) {
     const { canonical, fns } = tryParser(name);
+    if (fns.length) return { sourcetype: canonical, functions: fns };
+  }
+  // Format before content match: framed CEF would otherwise meet vendor syslog
+  // regexes (Infoblox CEF matched the VMware NSX parser).
+  const cefSource = recognizeCefSource(events);
+  if (cefSource) {
+    const { canonical, fns } = tryParser(cefSource.sourcetype);
     if (fns.length) return { sourcetype: canonical, functions: fns };
   }
   const match = matchDatatypeParserBySample(events);

@@ -18,7 +18,8 @@
     "zscaler_web": "Precise: zscaler_web_logs is the real JSON web-transaction sample (20 events). A bare 'zscaler' also pulls ZPA/ZIA/firewall/LEEF variants that are NOT web proxy logs; keep it targeted so the web pack gets the web sample.",
     "zscaler:nssweblog": "zscaler:nssweblog (Splunk NSS web-transaction sourcetype) IS the zscaler_web JSON format — point it at the same real 20-event sample rather than letting it fall to AI.",
     "infoblox_dns": "DNS-specific — a bare 'infoblox' greedily matches dhcp/ntpd/leef/audit/etc.",
-    "corelight_conn": "Corelight/Zeek conn logs — target the cl_conn keys (20-event CL_Conn_300), NOT a bare 'corelight' (matches ccs_threat_info_corelight_notice, 1 event). Corelight is a commercial Zeek distro, so zeek_conn resolves the same sample."
+    "corelight_conn": "Corelight/Zeek conn logs — target the cl_conn keys (20-event CL_Conn_300), NOT a bare 'corelight' (matches ccs_threat_info_corelight_notice, 1 event). Corelight is a commercial Zeek distro, so zeek_conn resolves the same sample.",
+    "cef": "Generic CEF — target cef_syslog_samples (12 real multi-vendor CEF lines: Trend Micro, Citrix, …). A bare 'cef' substring matches every *_cef key, and the most-events pick then served roundcube_mail_to_cef_sample: 20 Roundcube text lines with NO CEF header (a pack that converts TO CEF), so a generic cef build parsed nothing."
   },
   "aliases": {
     "cisco_asa": [
@@ -29,7 +30,8 @@
     "cisco_ftd": [
       "cisco_ftd",
       "ftd_cleanup",
-      "cisco-ftd"
+      "cisco-ftd",
+      "ftd_sample"
     ],
     "cisco_firepower": [
       "firepower",
@@ -220,6 +222,9 @@
       "bigip_syslog",
       "f5-asm-syslog",
       "f5-ltm-irule"
+    ],
+    "cef": [
+      "cef_syslog_samples"
     ]
   },
   "storeKeys": {

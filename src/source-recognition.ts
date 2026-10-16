@@ -14,6 +14,7 @@
  */
 import datatypeParsersData from '../config/datatype-parsers.json';
 import sourceSampleKeysData from '../config/source-sample-keys.json';
+import { parseSecurityHeader, sampleSecurityHeader, type SourceWireFormat } from './sample-format';
 
 // Golden-path predicate is injected by pack-builder (which owns golden-formats.json)
 // so getSupportedSourcetypeCatalog can flag golden-buildable sourcetypes WITHOUT this
@@ -107,12 +108,19 @@ export function extractSampleKeys(rawLines: string[]): { format: ExtractionCover
   // key=value pairs (SAP/FortiGate/ASA-KVP). Keys are word chars; values are
   // quoted or run to the next space. Require several pairs per line to qualify.
   const kvRe = /(?:^|\s)([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|\S*)/g;
+  // Pipe-separated PAIRS (Check Point RFC5424 `time=…|hostname=…|product=…`, LEEF
+  // with a `|` delimiter): the space rule reads the whole run as one value and
+  // finds 3 keys in a 20-key line. A line with two or more `|key=` is pipe-paired,
+  // so `|` separates pairs and ends values there. Every other line reads exactly
+  // as before, so no stored fingerprint of a space-delimited source moves.
+  const kvPipeRe = /(?:^|[\s|])([A-Za-z_][\w.]*)=("(?:[^"\\]|\\.)*"|[^\s|]*)/g;
   let kvLines = 0;
   for (const l of sample) {
     const src = isCef ? (l.split(/CEF:\d+\|/)[1] || l).split('|').slice(6).join('|') : l;
+    const re = (src.match(/\|[A-Za-z_][\w.]*=/g) || []).length >= 2 ? kvPipeRe : kvRe;
     let n = 0; let m: RegExpExecArray | null;
-    kvRe.lastIndex = 0;
-    while ((m = kvRe.exec(src)) !== null) { keys.add(m[1]); n++; }
+    re.lastIndex = 0;
+    while ((m = re.exec(src)) !== null) { keys.add(m[1]); n++; }
     if (n >= 2) kvLines++;
   }
   if (kvLines >= Math.max(1, sample.length * 0.5)) return { format: isCef ? 'cef' : 'kvp', keys };
@@ -155,7 +163,31 @@ interface GoldenSourceExpectation {
    * loose syslog-shaped pattern can never auto-adopt the wrong golden path.
    */
   distinctive?: boolean;
+  /**
+   * The NATIVE wire formats (sample-format.ts vocabulary), when `format` is too
+   * coarse to say. `format` is the fingerprint's vocabulary, and it blurs exactly
+   * the distinctions the golden store keys on: Windows Event XML fingerprints
+   * `kvp` (its attributes look like pairs) and `unstructured` covers free text
+   * AND delimited columns. Unset → derived from `format` (see
+   * `nativeSourceWireFormats`). Never consulted by `matchesExpectation`, so
+   * declaring it cannot change which samples the golden guard admits.
+   */
+  wire?: SourceWireFormat[];
+  /**
+   * The sample must BE CEF: at least `CEF_SAMPLE_SHARE` of its lines carry a
+   * `CEF:N|` header (bare or syslog-framed), the same rule `recognizeCefSource`
+   * reads. Only the generic `cef` parser sets it — it has no vendor keys to check,
+   * so without it every lenient branch below (keyless text, a kvp sample) passed,
+   * and a header-less Roundcube text sample took the CEF golden path and parsed
+   * nothing.
+   */
+  requireCefHeader?: boolean;
 }
+
+// A VPC flow record in any layout the aws_vpc parser reads: default (v2/v5/ECS,
+// `-` allowed for a NODATA account/ENI), Transit Gateway (`<v> <type> <account> tgw-…`),
+// v3 custom (`<v> vpc-…`) — bare or inside a CloudWatch `"message":"…"` envelope.
+const VPC_FLOW_LINE = /(?:^|"message"\s*:\s*")\s*\d+\s+(?:(?:\d{12}|-)\s+(?:eni-\S+|-)\s|\S+\s+\d{12}\s+tgw-|vpc-)/m;
 
 const GOLDEN_SOURCE_EXPECTATIONS: Record<string, GoldenSourceExpectation> = {
   cisco_asa: {
@@ -185,20 +217,17 @@ const GOLDEN_SOURCE_EXPECTATIONS: Record<string, GoldenSourceExpectation> = {
   // must NOT take this golden path — the envelope regex would extract nothing.
   infoblox_dns: {
     format: 'unstructured',
-    patterns: [/^<\d+>\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+.*?\b(?:named|dhcpd|httpd)\[\d+\]:/m],
+    // The `named|dhcpd|httpd[pid]:` process marker is the discriminator; the PRI
+    // and the timestamp form vary with the relay (see the parser's envelope regex).
+    patterns: [/^(?:<\d+>)?(?:\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\S*|\w{3}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2})\s+\S+.*?\b(?:named|dhcpd|httpd)\[\d+\]:/m],
   },
   // Rule 14: without an expectation the golden guard cannot check format, so a
   // JSON/CloudWatch-wrapped VPC sample would still take the golden path and the
-  // space-delimited regex would extract nothing. The v2/v5 default record starts
-  // `<version> <12-digit account> eni-...`.
-  aws_vpc_v5: {
-    format: 'unstructured',
-    patterns: [/^\d+\s+\d{12}\s+eni-\S+\s+\S+\s+\S+\s+\d+\s+\d+\s+\d+\s/m],
-  },
-  aws_vpc_v2: {
-    format: 'unstructured',
-    patterns: [/^\d+\s+\d{12}\s+eni-\S+\s+\S+\s+\S+\s+\d+\s+\d+\s+\d+\s/m],
-  },
+  // space-delimited regex would extract nothing. Every layout the parser reads:
+  // the default record `<version> <account|-> <eni-…|-> …` (v2/v5/ECS, also in a
+  // CloudWatch {"message":…} envelope), Transit Gateway, and v3 custom (vpc-id first).
+  aws_vpc_v5: { format: 'unstructured', patterns: [VPC_FLOW_LINE] },
+  aws_vpc_v2: { format: 'unstructured', patterns: [VPC_FLOW_LINE] },
   palo_alto_traffic: {
     format: 'unstructured',
     patterns: [/,TRAFFIC,/],
@@ -221,12 +250,23 @@ const GOLDEN_SOURCE_EXPECTATIONS: Record<string, GoldenSourceExpectation> = {
   },
   windows_powershell: {
     format: 'unstructured',
-    patterns: [/LogName=.*(?:PowerShell|Security|System)/i, /EventCode=\d+/],
+    // The classic Splunk-rendered form (`LogName=… EventCode=…`) reads as
+    // key=value line by line, as free text when the Message dominates. The parser
+    // reads Windows Event XML too, and the last two patterns admit it — but XML
+    // stays OUT of `wire`, so an XML build files under its own
+    // `windows_powershell@xml` golden and never replays the classic corpus.
+    wire: ['kvp', 'text'],
+    patterns: [
+      /LogName=.*(?:PowerShell|Security|System)/i, /EventCode=\d+/,
+      /<Provider\s+Name=['"](?:Microsoft-Windows-PowerShell|PowerShell)['"]/i,
+      /<Channel>(?:Microsoft-Windows-PowerShell\/Operational|Windows PowerShell)<\/Channel>/i,
+    ],
   },
   windows_security: {
     // XML attributes make the fingerprinter detect 'kvp'; the critical keys are
     // XML attribute names that only appear in Windows Event XML.
     format: 'kvp',
+    wire: ['xml'],
     keys: ['xmlns', 'name', 'systemtime', 'processid', 'guid', 'threadid'],
   },
   // Per-channel Windows XML canonicals. The guard's job here is FORMAT
@@ -241,33 +281,101 @@ const GOLDEN_SOURCE_EXPECTATIONS: Record<string, GoldenSourceExpectation> = {
   // read nothing out of it.
   windows_sysmon: {
     format: 'kvp',
+    wire: ['xml'],
     keys: ['xmlns', 'name', 'systemtime', 'processid', 'guid', 'threadid'],
   },
   windows_dns_client: {
     format: 'kvp',
+    wire: ['xml'],
     keys: ['xmlns', 'name', 'systemtime', 'processid', 'guid', 'threadid'],
   },
   windows_defender: {
     format: 'kvp',
+    wire: ['xml'],
     keys: ['xmlns', 'name', 'systemtime', 'processid', 'guid', 'threadid'],
   },
+  // XML is the native wire (the stored corpus keeps the plain golden key).
+  // Cribl Edge ships the same channel as JSON, and Splunk classic as
+  // `LogName=… EventCode=…`. Those two do not share the XML attribute keys, so
+  // `alsoFormats` alone still fails the 50% key overlap — the same reason
+  // windows_powershell is `unstructured` plus patterns. `wire` stays xml, so a
+  // JSON or classic build files under `@json` / `@kvp` and never replays the
+  // XML golden. `alsoFormats` keeps `sourceMayEmitNativeFalsy` honest: Edge
+  // JSON carries real numbers (`Id`, `Level`).
   windows_system: {
-    format: 'kvp',
-    keys: ['xmlns', 'name', 'systemtime', 'processid', 'threadid'],
+    format: 'unstructured',
+    alsoFormats: ['json', 'kvp'],
+    wire: ['xml'],
+    patterns: [/<Event[\s>]/, /"LogName"\s*:/, /LogName=\S+/],
   },
   windows_application: {
-    // The Application channel has no Execution/Correlation elements on most
-    // providers, so `threadid`/`guid` are absent — requiring them would fail the
-    // 50%-overlap check on a perfectly good sample.
-    format: 'kvp',
-    keys: ['xmlns', 'name', 'systemtime', 'qualifiers'],
+    format: 'unstructured',
+    alsoFormats: ['json', 'kvp'],
+    wire: ['xml'],
+    patterns: [/<Event[\s>]/, /"LogName"\s*:/, /LogName=\S+/],
   },
+  // Task 7 — sources whose only parser was "Try JSON parse" on a non-JSON
+  // sample, or a JSON serde that emitted no canonical names. Patterns (not a
+  // key list) because the fingerprint of a syslog-framed kvp line is unstable
+  // across the vendor's own subtypes.
+  juniper_srx: {
+    format: 'unstructured',
+    patterns: [/source-address=|RT_FLOW|junos@/],
+  },
+  sophos_xg: {
+    format: 'unstructured',
+    patterns: [/\blog_type=|\blog_component=/i],
+  },
+  sonicwall_firewall: {
+    format: 'unstructured',
+    patterns: [/\bid=firewall\b/i],
+  },
+  pfsense: {
+    format: 'unstructured',
+    patterns: [/\bfilterlog(?:\[\d+\])?:/],
+  },
+  linux_secure: {
+    format: 'unstructured',
+    patterns: [/\b(?:sshd\[\d+\]|sudo:|pam_unix\()/],
+  },
+  cisco_umbrella: {
+    format: 'unstructured',
+    patterns: [/^"?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}",/m],
+  },
+  leef: {
+    format: 'unstructured',
+    patterns: [/LEEF:\d/],
+  },
+  okta_system: {
+    format: 'json',
+    keys: ['published', 'eventtype', 'actor', 'outcome', 'displaymessage'],
+  },
+  o365_management_activity: {
+    format: 'json',
+    keys: ['creationtime', 'operation', 'organizationid', 'workload', 'userkey', 'recordtype'],
+  },
+  barracuda_cloudgen_firewall: {
+    format: 'json',
+    keys: ['timestamp', 'src_ip', 'source_ip', 'dst_ip', 'destination_ip'],
+  },
+  cisco_sfw_estreamer: {
+    format: 'json',
+    keys: ['initiatorip', 'responderip', 'protocol', 'eventtype', 'connectionid'],
+  },
+  // FortiGate and Check Point can each be configured to emit real CEF, and both
+  // parsers read it (FortiGate: its own CEF branch + FTNTFGT* prefix strip;
+  // Check Point: cefKeyDictionaryFunctions runs first) — declared so CEF
+  // detection may name them (recognizeCefSource). The golden store files a CEF
+  // build under its own `@cef` variant either way: `alsoFormats` is not native.
+  // Admission is unchanged: the kvp<->cef leniency already let CEF through.
   fortinet_fortigate: {
     format: 'kvp',
+    alsoFormats: ['cef'],
     keys: ['date', 'time', 'devname', 'devid', 'logid', 'type', 'srcip', 'dstip'],
   },
   checkpoint_firewall: {
     format: 'kvp',
+    alsoFormats: ['cef'],
     keys: ['action', 'src', 'dst', 'loguid', 'origin', 'product', 'conn_direction'],
   },
   sap_audit: {
@@ -363,11 +471,11 @@ const GOLDEN_SOURCE_EXPECTATIONS: Record<string, GoldenSourceExpectation> = {
   corelight_reporter: { format: 'json', keys: ['_path', 'ts'] },
   corelight_suricata_enriched: { format: 'json', keys: ['_path', 'ts'] },
   corelight_suricata_eve: { format: 'json', keys: ['_path', 'ts'] },
-  // Generic CEF has no vendor-specific keys to check — the fingerprint's own
-  // `cef` format classification (real `CEF:N|...` header) IS the expectation.
+  // Generic CEF has no vendor-specific keys to check — a real `CEF:N|...` header
+  // IS the expectation, so it is required outright (`requireCefHeader`).
   // Vendors with a richer dedicated parser (FortiGate, Zscaler, Check Point)
   // declare their OWN kvp/cef expectation above and never fall through to this.
-  cef: { format: 'cef' },
+  cef: { format: 'cef', requireCefHeader: true },
 };
 
 /**
@@ -413,6 +521,114 @@ export function sourceMayEmitNativeFalsy(sourcetype: string): boolean {
   return expectation.format !== 'unstructured' || !!expectation.alsoFormats?.includes('json');
 }
 
+// --- Wire formats per source (the golden store's format dimension) -----------
+//
+// A source can ship more than one wire format (FortiGate: key=value or CEF;
+// Zscaler NSS: key=value, JSON or CEF). A golden learned from one format is
+// wrong for another, so the golden store keys on the wire format as well as the
+// sourcetype (golden-variant.ts). These two answers say which formats are the
+// source's own: the NATIVE ones share the plain sourcetype key (that is what the
+// existing corpus was built from), every other format gets its own variant.
+
+const WIRE_BY_FINGERPRINT: Record<GoldenSourceExpectation['format'], SourceWireFormat[]> = {
+  json: ['json'],
+  kvp: ['kvp'],
+  cef: ['cef'],
+  unstructured: ['text', 'csv', 'tsv', 'psv'],
+};
+
+/**
+ * The wire formats this source NATIVELY ships: the primary format its static
+ * parser was written for. Null when the sourcetype declares no expectation —
+ * "unknown", never "anything".
+ */
+export function nativeSourceWireFormats(sourcetype: string): SourceWireFormat[] | null {
+  const expectation = GOLDEN_SOURCE_EXPECTATIONS[canonicalizeSourcetype(sourcetype)];
+  if (!expectation) return null;
+  return [...(expectation.wire || WIRE_BY_FINGERPRINT[expectation.format])];
+}
+
+/** Every wire format this source's static parser reads: native plus `alsoFormats`. */
+export function parserWireFormats(sourcetype: string): SourceWireFormat[] | null {
+  const expectation = GOLDEN_SOURCE_EXPECTATIONS[canonicalizeSourcetype(sourcetype)];
+  const native = nativeSourceWireFormats(sourcetype);
+  if (!expectation || !native) return null;
+  const extra = (expectation.alsoFormats || []).flatMap(f => WIRE_BY_FINGERPRINT[f]);
+  return [...new Set([...native, ...extra])];
+}
+
+// --- CEF: the header names the vendor ----------------------------------------
+//
+// CEF carries its own Device Vendor / Device Product, so for a CEF sample the
+// source is READ from the header rather than guessed from extension keys. The
+// vendor's own sourcetype is chosen only when that vendor's parser reads its CEF
+// at least as well as the generic CEF Key Dictionary parser does — measured, not
+// assumed from a parser merely having a CEF branch:
+//   - FortiGate: richer. Its FTNTFGT* prefix strip recovers the event time
+//     (`eventtime`, ns — the syslog header the generic parser falls back on has
+//     no year), policy, vdom, duration and application.
+//   - Check Point: identical output — `cefKeyDictionaryFunctions` runs first.
+//   - NOT Zscaler NSS: its CEF branch maps the NSS key=value names (`login`,
+//     `requestmethod`) and misses the CEF-standard `suser` / `dhost` /
+//     `requestMethod` / `requestClientApplication` the generic parser reads, so
+//     it stays on `cef` until that branch reads them.
+// Every other vendor builds with the generic `cef` parser, which is what a CEF
+// sample got before — never a vendor parser that would read less out of it.
+// `parserWireFormats` must still include 'cef' — a backstop against an entry
+// here outliving its parser's CEF branch.
+
+const CEF_HEADER_SOURCETYPES: Array<{ vendor: RegExp; product?: RegExp; sourcetype: string }> = [
+  { vendor: /^fortinet$/i, product: /^forti\s*gate$/i, sourcetype: 'fortinet_fortigate' },
+  { vendor: /^check\s*point$/i, sourcetype: 'checkpoint_firewall' },
+];
+
+/** Share of lines that must carry a CEF header before the sample IS CEF. */
+const CEF_SAMPLE_SHARE = 0.6;
+
+export interface CefSourceRecognition {
+  /** Sourcetype to build with: the vendor's own when its parser reads CEF, else `cef`. */
+  sourcetype: string;
+  /** Dominant Device Vendor / Product, empty when no vendor carries the majority. */
+  vendor: string;
+  product: string;
+  /** True when `sourcetype` is the vendor's own parser rather than generic `cef`. */
+  dedicated: boolean;
+  reason: string;
+}
+
+/**
+ * The source of a CEF sample, read from its header. Null when fewer than
+ * `CEF_SAMPLE_SHARE` of the lines carry a CEF header (syslog-framed or not), so
+ * a non-CEF sample is left to the other recognisers. LEEF is not claimed: there
+ * is no generic LEEF parser to fall back on.
+ */
+export function recognizeCefSource(sampleEvents: string): CefSourceRecognition | null {
+  const lines = (sampleEvents || '').split('\n').map(l => stripOuterQuotes(l.trim())).filter(Boolean).slice(0, 40);
+  if (lines.length === 0) return null;
+  const cefLines = lines.filter(l => parseSecurityHeader(l)?.format === 'cef');
+  if (cefLines.length < Math.max(1, Math.ceil(lines.length * CEF_SAMPLE_SHARE))) return null;
+  const header = sampleSecurityHeader(cefLines);
+  const dominant = header && header.format === 'cef' && header.share >= CEF_SAMPLE_SHARE ? header : null;
+  const vendor = dominant?.vendor || '';
+  const product = dominant?.product || '';
+  const named = [vendor, product].filter(Boolean).join(' ');
+  const hit = dominant
+    ? CEF_HEADER_SOURCETYPES.find(e => e.vendor.test(vendor) && (!e.product || e.product.test(product)))
+    : undefined;
+  if (hit && parserWireFormats(hit.sourcetype)?.includes('cef')) {
+    return {
+      sourcetype: hit.sourcetype, vendor, product, dedicated: true,
+      reason: `Format first: the sample is CEF, and its header names the source (Device Vendor/Product "${named}"). Sourcetype is ${hit.sourcetype}, whose parser reads CEF.`,
+    };
+  }
+  return {
+    sourcetype: 'cef', vendor, product, dedicated: false,
+    reason: named
+      ? `Format first: the sample is CEF from "${named}" (read from the header). Sourcetype is cef — the generic CEF Key Dictionary parser reads this vendor's header and extension best.`
+      : 'Format first: the sample is CEF, with no single Device Vendor in the header. Sourcetype is cef — the generic CEF Key Dictionary parser.',
+  };
+}
+
 /**
  * How many of `keys` appear as REAL delimited pairs in the raw sample text
  * (`key=` for kvp/cef, `"key":` for json), case-insensitively. This is stronger
@@ -431,6 +647,7 @@ function countDelimitedKeys(keys: string[], sampleEvents: string): number {
 }
 
 function matchesExpectation(expectation: GoldenSourceExpectation, sampleEvents: string): boolean {
+  if (expectation.requireCefHeader) return recognizeCefSource(sampleEvents) !== null;
   const fp = sampleFingerprint(sampleEvents);
 
   if (expectation.format === 'unstructured') {
@@ -602,6 +819,11 @@ const SOURCETYPE_ALIASES: Record<string, string> = {
   // `checkpoint_cef` as an alias) — routing this to bare `cef` would have
   // resolved XSIAM to an unresolved T4 instead of that dedicated pipeline.
   checkpoint_cef: 'checkpoint_firewall',
+  // `<product>_cef` names the product plus its wire format. Without an alias the
+  // name has no parser and its goldens split from the canonical ones
+  // (`checkpoint_firewall_cef@cef` beside `checkpoint_firewall@cef`).
+  checkpoint_firewall_cef: 'checkpoint_firewall',
+  fortinet_fortigate_cef: 'fortinet_fortigate',
   alibaba_actiontrail: 'alibaba_action_trail',
   action_trail: 'alibaba_action_trail',
   actiontrail: 'alibaba_action_trail',
@@ -760,6 +982,12 @@ const SOURCETYPE_ALIASES: Record<string, string> = {
   // resolving to a key of its own, with no parser and no golden path behind it.
   vmwarensx: 'vmware_nsx',
   ivantitop: 'ivanti_top',
+  // Ivanti appliances are Linux boxes; a Splunk TA ships their OS files under an
+  // `ivanti_` prefix. These three are the plain Linux logs, so they take the Linux
+  // parsers and goldens instead of the vendor-only Ivanti hint.
+  ivanti_linux_audit: 'linux_audit',
+  ivanti_linux_secure: 'linux_secure',
+  ivanti_messages: 'linux_syslog',
   httpfpcmetadata: 'http_fpc_metadata',
   // Generic, vendor-agnostic ArcSight/Micro Focus CEF (Common Event Format) —
   // for a device that ships CEF with no dedicated vendor parser. checkpoint_cef
@@ -1008,6 +1236,7 @@ export interface SourcetypeRecognition {
   logFamily?: string;          // identified log family
   description?: string;        // human product/log-family description
   evidence?: string;           // short why-this-was-selected note
+  nonEvent?: string;           // why this name is not a security log source (unresolved, no AI rescue)
 }
 
 // Curated recognition hints for REAL, identifiable sources that we do NOT have a
@@ -1063,6 +1292,9 @@ const RECOGNITION_HINTS: RecognitionHint[] = [
   // `access_log`/`access_combined` names are aliased to apache_access above (golden
   // path) — the alias tier runs first, so only the non-apache-golden variants land
   // here. Two token pairs keep these specific enough to avoid false positives.
+  // An LDAP server's access log is a directory log, not a web log: three tokens
+  // so it outranks the two-token access/log pair below.
+  { tokens: ['ldap', 'access', 'log'], vendor: 'LDAP server', product: 'Directory access log', logFamily: 'directory', description: 'LDAP directory server access log (OpenLDAP / 389-DS / Oracle DS)' },
   { tokens: ['access', 'log'], vendor: 'Web Server', product: 'Access log', logFamily: 'web', description: 'Web/application server access log (combined-log-format family)' },
   { tokens: ['error', 'log'], vendor: 'Web Server', product: 'Error log', logFamily: 'web', description: 'Web/application server error log' },
   { tokens: ['mod', 'jk'], vendor: 'Apache', product: 'mod_jk connector', logFamily: 'web', description: 'Apache/Tomcat mod_jk connector log' },
@@ -1139,7 +1371,8 @@ const RECOGNITION_HINTS: RecognitionHint[] = [
   { tokens: ['ssm', 'agent'], vendor: 'AWS', product: 'Systems Manager Agent', logFamily: 'cloud_management', description: 'AWS SSM Agent audit/operation logs' },
   { tokens: ['foreman'], vendor: 'Red Hat', product: 'Foreman/Katello', logFamily: 'management', description: 'Foreman/Katello lifecycle-management logs' },
   { tokens: ['aemcdn'], vendor: 'Adobe', product: 'Experience Manager CDN', logFamily: 'web_firewall', description: 'Adobe AEM CDN / WAF logs' },
-  { tokens: ['stream', 'dns'], vendor: 'Cribl', product: 'Stream DNS', logFamily: 'dns', description: 'Cribl Stream DNS capture logs' },
+  // `stream:*` is the Splunk Stream app's wire-data sourcetype family, not Cribl.
+  { tokens: ['stream', 'dns'], vendor: 'Splunk', product: 'Stream (wire data)', logFamily: 'dns', description: 'Splunk Stream DNS wire-data capture (stream:dns)' },
   { tokens: ['sysmon', 'deploy'], vendor: 'Splunk', product: 'Sysmon deployment log', logFamily: 'management', description: 'Sysmon TA deployment/install log (NOT Sysmon events)' },
   { tokens: ['datadiode'], vendor: 'Data Diode', product: 'Data diode', logFamily: 'network', description: 'Unidirectional data-diode gateway syslog', glued: true },
   { tokens: ['netbackup'], vendor: 'Veritas', product: 'NetBackup', logFamily: 'backup', description: 'Veritas NetBackup job/connection logs', glued: true },
@@ -1153,6 +1386,38 @@ const RECOGNITION_HINTS: RecognitionHint[] = [
 // tokenizes to two so it hits the normal subset path). Guarded so the glued
 // token is a real prefix (≥3 chars, next char is not a letter that would make it
 // a different word — we require the remainder to be a plausible subtype suffix).
+// Names that are not security log sources: Splunk's own data (summary index,
+// internal logs, ES alert actions) and OS scripted inputs (ps/top output). The
+// hint table used to pass them as products ("stash" → Atlassian Bitbucket,
+// "ivanti_ps" → Ivanti appliance), so a batch built OCSF packs for process
+// tables. Matched on the whole reduced name, or as the trailing tokens after a
+// vendor/host prefix (ivanti_ps, ivanti_splunkd) — never as a substring, so
+// "laptop" and "desktop" are untouched. A stored golden under the exact name
+// still wins in the batch pre-flight: someone built and tested it as written.
+const NON_EVENT_SOURCES: Record<string, string> = {
+  stash: 'Splunk summary-index data (written by `collect`), not a log source',
+  stash_new: 'Splunk summary-index data (written by `collect`), not a log source',
+  splunkd: "Splunk's own daemon log, not a security log source",
+  splunk_metrics_log: "Splunk's internal metrics log, not a security log source",
+  modular_alerts_risk: 'Splunk ES risk alert-action output, not a log source',
+  ps: 'process-table output from an OS scripted input, not a security log',
+  top: 'top output from an OS scripted input, not a security log',
+  vmstat: 'vmstat output from an OS scripted input, not a security log',
+  iostat: 'iostat output from an OS scripted input, not a security log',
+  servicestatus: 'service-status output from an OS scripted input, not a security log',
+};
+
+/** Why a (normalized) name is not a security log source, or null. */
+export function nonEventSourceReason(normalized: string): string | null {
+  const n = stripRotationSuffix(stripNamespacePrefix(normalized) ?? stripHostPrefix(normalized) ?? normalized);
+  if (!n) return null;
+  if (NON_EVENT_SOURCES[n]) return NON_EVENT_SOURCES[n];
+  for (const [name, reason] of Object.entries(NON_EVENT_SOURCES)) {
+    if (n.endsWith(`_${name}`)) return reason;
+  }
+  return null;
+}
+
 function matchRecognitionHint(tokens: string[]): RecognitionHint | null {
   const tset = new Set(tokens);
   let best: RecognitionHint | null = null;
@@ -1403,6 +1668,18 @@ export function recognizeSourcetype(sourcetypeRaw: string, evidence?: Recognitio
   // Feed the hint matcher the most-reduced form: strip namespace/host prefix and
   // any rotation/size suffix so a glued lone-token hint (ora → oraapxaudit) fires
   // even on oraapxaudit_too_small.
+  // Not a log source at all (Splunk internals, OS scripted inputs): unresolved,
+  // with the reason, before a vendor hint can call it a product.
+  const nonEvent = nonEventSourceReason(normalized);
+  if (nonEvent) {
+    return {
+      original, normalized, canonical: normalized, canonicalDisplay: display,
+      tier: 'none', status: 'unresolved', known: false, hasGolden: false,
+      confidence: 'none', score: 10, description: nonEvent, nonEvent,
+      evidence: `not a security log source: ${nonEvent}`,
+    };
+  }
+
   const hintTokens = stripRotationSuffix(stripNamespacePrefix(normalized) ?? stripHostPrefix(normalized) ?? normalized);
   const hint = matchRecognitionHint(tokenizeLabel(hintTokens));
   if (hint) {
@@ -1506,8 +1783,18 @@ const SOURCETYPE_DESCRIPTIONS: Record<string, string> = {
   windows_security: 'Windows Security Event Log (XML)',
   windows_powershell: 'Windows PowerShell script block logs',
   windows_sysmon: 'Windows Sysmon endpoint telemetry',
-  windows_system: 'Windows System Event Log channel (XML)',
-  windows_application: 'Windows Application Event Log channel (XML)',
+  windows_system: 'Windows System channel (XML, Cribl Edge JSON, or classic text)',
+  windows_application: 'Windows Application channel (XML, Cribl Edge JSON, or classic text)',
+  juniper_srx: 'Juniper SRX firewall (RFC5424 structured syslog)',
+  sophos_xg: 'Sophos XG firewall key=value syslog',
+  sonicwall_firewall: 'SonicWall firewall key=value syslog',
+  pfsense: 'pfSense filterlog syslog',
+  linux_secure: 'Linux secure log (sshd, sudo, pam)',
+  cisco_umbrella: 'Cisco Umbrella DNS and proxy logs',
+  leef: 'LEEF (Log Event Extended Format) syslog',
+  barracuda_cloudgen_firewall: 'Barracuda CloudGen Firewall JSON',
+  cisco_sfw_estreamer: 'Cisco Secure Firewall eStreamer JSON',
+  o365_management_activity: 'Microsoft 365 Management Activity audit JSON',
   windows_defender: 'Microsoft Defender Antivirus operational log (XML)',
   windows_dns_client: 'Windows DNS Client operational log (XML)',
   azure_signin: 'Azure AD sign-in logs',
@@ -1702,7 +1989,31 @@ const ENVELOPE_GROUP_NAMES = new Set([
   'syslog_timestamp', 'timestamp', 'syslog_host', 'host', 'hostname',
   'app', 'appname', 'app_name', 'process', 'proc', 'pid', 'procid', 'tag',
   'message', 'msg', 'payload',
+  // The rest of the RFC5424 header. Without these a bare RFC5424 envelope anchor
+  // (infoblox_cef_rfc5424, infoblox_leef_rfc5424, syslog_rfc5424, NSX) scored
+  // VERSION/MSGID/STRUCTURED-DATA as content and claimed every RFC5424 line at
+  // 100% — Juniper SRX structured-data logs were named infoblox_cef_rfc5424.
+  'version', 'proc_id', 'msg_id', 'msgid', 'structured_data',
+  // …and its structured-data wrapper, which any RFC5424 sender fills
+  // (`[junos@2636 …]`), so reading it proves nothing about the source.
+  'sd_id', 'sd_kvp_payload',
 ]);
+
+// Datatypes whose parser reads a wire format SHARED by many sources, so a
+// structural fit cannot name the source — the sample must also carry the
+// source's own token. The token gates (no line carries it → no candidate) and
+// it qualifies: a matched line that carries it counts as content even when the
+// anchor captured only envelope.
+// - microsoft_dhcp_syslog is a generic MSWinEventLog (Snare/NXLog) tab parser:
+//   every Windows Security event forwarded that way fits it, and was named DHCP
+//   once the matcher followed its payload continuation.
+// - proofpoint_tap_rfc5424's anchor is a bare RFC5424 envelope plus a scratch
+//   structured-data payload, so the SD-ID (21139 = Proofpoint's IANA enterprise
+//   number) is the only thing that tells TAP from any other RFC5424 sender.
+const DATATYPE_SOURCE_EVIDENCE: Record<string, RegExp> = {
+  microsoft_dhcp_syslog: /dhcp/i,
+  proofpoint_tap_rfc5424: /\btapmsg@21139\b|\bProofpointTAP\b/,
+};
 
 // ---------------------------------------------------------------------------
 // JSON content-signature recognition.
@@ -1788,23 +2099,39 @@ export function matchDatatypeParserBySample(sampleEvents: string): DatatypeSampl
 
   for (const [key, dtp] of Object.entries(DATATYPE_PARSERS)) {
     if (dtp.functions.filter(f => f.id !== 'comment').length === 0) continue;
+    const evidence = DATATYPE_SOURCE_EVIDENCE[key];
+    if (evidence && !rawLines.some(l => evidence.test(l))) continue;
 
     // Signal 1 — anchor-regex match + capture richness. A parser may carry
     // several alternative header regexes (e.g. ASA with vs without a year in the
     // timestamp); test each and keep the best-fitting anchor.
     let regexConf = 0;
     const anchorFns = dtp.functions.filter(f => f.id === 'regex_extract' && (f.conf as any)?.regex);
+    // Continuations: regexes that read a field an EARLIER regex captured (NSX's
+    // firewall body in `message`, Infoblox's `__cef_message`). An RFC5424 envelope
+    // anchor alone fits every RFC5424 line, so the source's own content is only
+    // visible by following the chain — run them over what the anchor captured.
+    const continuations = anchorFns
+      .map(f => ({ source: String((f.conf as any).source || '_raw'), re: criblRegexToJs(String((f.conf as any).regex)) }))
+      .filter((c): c is { source: string; re: RegExp } => c.source !== '_raw' && c.re !== null);
     for (const anchorFn of anchorFns) {
       const rxStr = String((anchorFn.conf as any).regex);
       const anchor = criblRegexToJs(rxStr);
       const groupCount = (rxStr.match(/\(\?<[A-Za-z_$][\w$]*>/g) || []).length;
       if (!anchor || groupCount === 0) continue;
-      let matched = 0, contentSum = 0;
+      let matched = 0, contentSum = 0, evidenced = 0;
       for (const line of rawLines) {
         const mm = line.match(anchor);
         if (mm) {
           matched++;
-          const g = mm.groups || {};
+          if (evidence?.test(line)) evidenced++;
+          const g: Record<string, string | undefined> = { ...(mm.groups || {}) };
+          for (const c of continuations) {
+            const src = g[c.source];
+            const cm = typeof src === 'string' ? src.match(c.re) : null;
+            if (!cm?.groups) continue;
+            for (const [ck, cv] of Object.entries(cm.groups)) if (g[ck] === undefined) g[ck] = cv;
+          }
           // Count only CONTENT groups toward richness — exclude syslog-envelope
           // and `__scratch` names. A generic envelope parser (fortinet/pan
           // "_syslog_wrapped") captures syslog_timestamp/host/app/__payload for
@@ -1825,8 +2152,10 @@ export function matchDatatypeParserBySample(sampleEvents: string): DatatypeSampl
       }
       const matchRate = matched / rawLines.length;
       const avgContent = matched ? contentSum / matched : 0;
-      // Reject catch-all / envelope-only anchors: require ≥2 real content groups.
-      if (avgContent >= 2 && matchRate > regexConf) regexConf = matchRate;
+      // Reject catch-all / envelope-only anchors: require ≥2 real content groups,
+      // or the source's own evidence token on every matched line.
+      const qualified = avgContent >= 2 || (matched > 0 && evidenced === matched);
+      if (qualified && matchRate > regexConf) regexConf = matchRate;
     }
 
     // Signal 2 — declared-field overlap (structured kvp/csv wildcards).
@@ -1966,6 +2295,739 @@ function windowsXmlFrontEnd(channel: string, stripSpaces = false): PipelineFunct
 /** Windows Event `Level` → syslog severity number. Shared by every channel. */
 const WINDOWS_LEVEL_TO_SEVERITY =
   "Level == '0' ? 6 : Level == '1' ? 2 : Level == '2' ? 3 : Level == '3' ? 4 : Level == '4' ? 6 : Level == '5' ? 7 : undefined";
+
+/**
+ * An RFC 3164 `log_time` (`Jun  9 16:17:01`) has no year, and `new Date()` of it
+ * lands in 2001 — the TimeGenerated / `_time` of every linux_syslog and
+ * linux_secure event was 2001. Rewrite it to epoch ms in the current year, or
+ * last year when that would put it more than a day in the future (a December line
+ * read in January). Any other shape passes through unchanged.
+ */
+const RFC3164_LOG_TIME_WITH_YEAR =
+  "log_time && /^[A-Z][a-z]{2}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2}$/.test(String(log_time)) ? (Date.parse(log_time + ' ' + new Date().getFullYear()) > Date.now() + 86400000 ? Date.parse(log_time + ' ' + (new Date().getFullYear() - 1)) : Date.parse(log_time + ' ' + new Date().getFullYear())) : log_time";
+
+/**
+ * Cribl Edge JSON and Splunk classic text for a Windows channel, gated the
+ * same way windows_powershell gates XML against classic text. The XML
+ * front-end stays on `__win_xml` (it rewrites `_raw`, so a later function
+ * cannot re-test the original line). Classic is `!__win_xml` — its header
+ * regex is anchored on `MM/DD/YYYY … LogName=`, which neither XML nor Edge
+ * JSON satisfies, so running it on a JSON event extracts nothing.
+ */
+function windowsAlternateWires(): PipelineFunction[] {
+  return [
+    {
+      id: 'eval',
+      description: 'Mark Windows Event XML apart from Cribl Edge JSON',
+      conf: {
+        add: [
+          { name: '__win_xml', value: "/^\\s*<Event[\\s>]/.test(_raw)" },
+          { name: '__win_json', value: "/^\\s*\\{/.test(_raw)" },
+        ],
+      },
+    },
+    {
+      id: 'regex_extract',
+      filter: '!__win_xml',
+      description: 'Extract the classic WinEventLog header',
+      conf: {
+        source: '_raw',
+        regex: '/(?<log_time>\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\s+\\d{1,2}:\\d{2}:\\d{2}\\s+[AP]M)\\s+LogName=(?<LogName>\\S+)\\s+SourceName=(?<SourceName>.+?)\\s+EventCode=(?<EventCode>\\d+)\\s+EventType=(?<EventType>\\d+)\\s+Type=(?<Type>\\w+)\\s+ComputerName=(?<ComputerName>\\S+)/',
+      },
+    },
+    {
+      id: 'regex_extract',
+      filter: '!__win_xml',
+      description: 'Extract account, process and command from the classic Message',
+      conf: {
+        source: '_raw',
+        regex: '/Account Name:\\s+(?<AccountName>\\S+)/',
+      },
+    },
+    {
+      id: 'regex_extract',
+      filter: '!__win_xml',
+      description: 'Extract the new process path and command line from a classic 4688 Message',
+      conf: {
+        source: '_raw',
+        regex: '/New Process Name:\\s+(?<NewProcessName>\\S+)[\\s\\S]*?Process Command Line:\\s+(?<CommandLine>.+?)(?:\\s+Token Elevation|$)/',
+      },
+    },
+    {
+      id: 'eval',
+      filter: '!__win_xml',
+      description: 'Alias classic WinEventLog fields to canonical names',
+      conf: {
+        add: [
+          { name: 'host', value: 'ComputerName || undefined' },
+          { name: 'hostname', value: 'ComputerName || undefined' },
+          { name: 'event_code', value: 'EventCode || undefined' },
+          { name: 'app', value: 'SourceName || undefined' },
+          { name: 'user', value: 'AccountName || undefined' },
+          { name: 'process', value: 'NewProcessName || undefined' },
+          { name: 'command', value: 'CommandLine || undefined' },
+          { name: 'message', value: 'Message || undefined' },
+          { name: 'signature', value: 'Type || undefined' },
+          { name: 'action', value: "Type == 'Information' || EventType == '4' || EventType == '0' ? 'success' : Type == 'Error' || EventType == '1' ? 'failure' : Type == 'Warning' || EventType == '2' ? 'failure' : undefined" },
+          { name: 'severity', value: "EventType == '1' ? 2 : EventType == '2' ? 4 : EventType == '4' || EventType == '0' ? 6 : undefined" },
+          { name: 'vendor', value: "'Microsoft'" },
+          { name: 'product', value: "'Windows'" },
+          { name: 'vendor_product', value: "'Microsoft Windows'" },
+        ],
+      },
+    },
+    {
+      id: 'regex_extract',
+      filter: '__win_json',
+      description: 'Extract the Edge JSON /Date(epoch)/ timestamp and numeric event id',
+      conf: { source: '_raw', regex: '/Date\\((?<log_time>\\d+)\\)/' },
+    },
+    {
+      id: 'regex_extract',
+      filter: '__win_json',
+      description: 'Extract the Edge JSON event id as text (Id is a number once JSON-parsed)',
+      conf: { source: '_raw', regex: '/"Id":(?<EventId>\\d+)/' },
+    },
+    {
+      id: 'serde',
+      filter: '__win_json',
+      description: 'Parse a Cribl Edge Windows event (JSON)',
+      conf: { mode: 'extract', type: 'json', srcField: '_raw' },
+    },
+    {
+      id: 'eval',
+      filter: '__win_json',
+      description: 'Alias Cribl Edge Windows JSON fields to canonical names',
+      conf: {
+        add: [
+          { name: 'host', value: 'MachineName || undefined' },
+          { name: 'hostname', value: 'MachineName || undefined' },
+          { name: 'event_code', value: 'EventId || Id || undefined' },
+          { name: 'app', value: 'ProviderName || undefined' },
+          { name: 'message', value: 'Message || undefined' },
+          { name: 'process_id', value: 'ProcessId || undefined' },
+          { name: 'user_id', value: 'UserId || undefined' },
+          { name: 'signature', value: 'LevelDisplayName || undefined' },
+          { name: 'severity', value: WINDOWS_LEVEL_TO_SEVERITY },
+          { name: 'vendor', value: "'Microsoft'" },
+          { name: 'product', value: "'Windows'" },
+          { name: 'vendor_product', value: "'Microsoft Windows'" },
+        ],
+      },
+    },
+  ];
+}
+
+/**
+ * Shared Windows Event → OCSF class dispatcher, ported from Simon's
+ * (github.com/simondev65/cribl-splunk-windows-to-json, `feature/ocsf-pipeline`)
+ * Windows_Events_to_OCSF pipeline — used here with his explicit OK. His STAGE 3
+ * (EventID/Sysmon-ID → OCSF class dispatch, ~15 classes) is ported almost
+ * verbatim; his STAGE 1/2 (raw XML/Classic parsing + Classic→XML field-name
+ * translation) is NOT re-implemented here — this function runs AFTER the
+ * existing `windowsXmlFrontEnd`/channel-specific parse-and-alias functions
+ * already in each `getParserForSourcetype` case, which already turned the raw
+ * XML into flat top-level fields named exactly like the XML `Data Name`
+ * attributes (TargetUserName, IpAddress, …) — the same names Simon's `ED`
+ * object would carry. So this dispatcher reads `__e.<Name>` directly instead
+ * of a nested `ED.<Name>`, which is a smaller, lower-risk adaptation than
+ * re-porting his custom XML/Classic parser.
+ *
+ * APPENDED (not substituted) after each channel's existing alias `eval` — the
+ * legacy canonical aliases (user, src_ip, host, event_code, severity, action,
+ * …) keep working exactly as before for every non-OCSF golden (CIM/ECS/CEF/…),
+ * so this is purely additive: it only ever adds `__ocsf_*` flat fields plus
+ * `__ocsf_unmapped_json` (a lossless JSON copy of every top-level field not
+ * already internal/routing — Simon's "nothing is dropped" guarantee, done
+ * generically instead of tracking per-builder consumption).
+ *
+ * `validateMappingStage` rejects any `code`/`regex_extract`/`serde`/`parser`
+ * function in a MAPPING golden — this dispatcher must stay in EXTRACTION,
+ * which has no such restriction (confirmed:
+ * shared-goldens/windows_security____extraction__.json already ships a `code`
+ * function). The corresponding `ocsf@windows_*` MAPPING goldens
+ * (config/golden-formats.json) are a thin declarative rename layer that only
+ * reads the `__ocsf_*` fields this function produces.
+ *
+ * Scope: Simon's dispatcher only recognises Security EventIDs, Sysmon
+ * EventIDs/Sysmon-IDs, System-channel Service-Control-Manager/EventLog
+ * EventIDs, and PowerShell 4104 script-block events — NOT the dedicated
+ * Microsoft-Windows-DNS-Client/Operational or Windows Defender/Operational
+ * providers (neither appears in his class-coverage table). For
+ * windows_dns_client / windows_defender this dispatcher therefore falls
+ * through to Base Event (class_uid 0) with full `unmapped` carry — a known,
+ * deliberate limitation, not a bug. Classic (non-XML) text events are also
+ * best-effort: the Classic alias blocks for windows_system/windows_powershell
+ * set canonical names, not raw XML Data Name fields, so most Classic events
+ * also land on Base Event with full `unmapped` carry rather than a specific
+ * class — full Classic→OCSF-class parity was out of scope for this pass.
+ */
+const WINDOWS_OCSF_DISPATCH_JS = `
+try {
+  var EID = Number(__e.EventID != null ? __e.EventID : (__e.EventCode != null ? __e.EventCode : __e.event_code));
+  var chanLc = String(__e.Channel || __e.LogName || '').toLowerCase();
+  var isSecurity = chanLc === 'security';
+  var isSystemChan = chanLc === 'system';
+  var isSysmon = chanLc.indexOf('sysmon') >= 0;
+  var isPowerShell = chanLc.indexOf('powershell') >= 0;
+
+  function nv(x) {
+    if (x == null) return null;
+    var s = String(x).trim();
+    if (s === '' || s === '-' || s === '0x0' || s.toUpperCase() === 'N/A' || s === 'NULL SID') return null;
+    return s;
+  }
+  function num(x) {
+    var s = nv(x);
+    if (s == null) return null;
+    var n = (s.length > 1 && s.charAt(0) === '0' && (s.charAt(1) === 'x' || s.charAt(1) === 'X')) ? parseInt(s, 16) : parseInt(s, 10);
+    return (n !== n) ? null : n;
+  }
+  function first() {
+    for (var i = 0; i < arguments.length; i++) { var v = nv(arguments[i]); if (v != null) return v; }
+    return null;
+  }
+  function lastSep(s) {
+    var idx = -1;
+    for (var i = 0; i < s.length; i++) { var c = s.charCodeAt(i); if (c === 92 || c === 47) idx = i; }
+    return idx;
+  }
+  function basename(p) { var s = nv(p); if (s == null) return null; var i = lastSep(s); return i >= 0 ? s.substring(i + 1) : s; }
+  function lid(x) {
+    var s = nv(x);
+    if (s == null) return null;
+    s = s.toLowerCase();
+    var allZero = true;
+    for (var i = 0; i < s.length; i++) { var c = s.charAt(i); if (c !== '0' && c !== 'x') { allZero = false; break; } }
+    return allZero ? null : s;
+  }
+  function guidv(g) {
+    var s = nv(g);
+    if (s == null) return null;
+    if (s.charAt(0) === '{') s = s.substring(1);
+    if (s.charAt(s.length - 1) === '}') s = s.substring(0, s.length - 1);
+    return s.toLowerCase();
+  }
+  function userTypeOf(sid, name) {
+    var s = nv(sid) || '';
+    if (s === 'S-1-5-18' || s === 'S-1-5-19' || s === 'S-1-5-20') return [3, 'System'];
+    if (s.indexOf('S-1-5-80-') === 0 || s.indexOf('S-1-5-90-') === 0 || s.indexOf('S-1-5-96-') === 0) return [3, 'System'];
+    if (s.indexOf('S-1-5-21-') === 0 && s.substring(s.length - 4) === '-500') return [2, 'Admin'];
+    var n = nv(name) || '';
+    if (n.charAt(n.length - 1) === '$') return [99, 'Computer'];
+    if (s.indexOf('S-1-5-21-') === 0) return [1, 'User'];
+    return null;
+  }
+  function mkUser(name, domain, sid) {
+    var n = nv(name), d = nv(domain), u = nv(sid);
+    if (n) {
+      var bs = -1;
+      for (var i = 0; i < n.length; i++) { if (n.charCodeAt(i) === 92) { bs = i; break; } }
+      if (bs > 0 && !d) { d = n.substring(0, bs); n = n.substring(bs + 1); }
+    }
+    if (n && /^S-1-\\d+(-\\d+)+$/.test(n) && !u) { u = n; n = null; }
+    if (!n && !u) return null;
+    var o = { name: n, domain: d, uid: u };
+    var t = userTypeOf(u, n);
+    if (t) { o.type_id = t[0]; o.type = t[1]; }
+    return o;
+  }
+  function targetUser() { return mkUser(__e.TargetUserName, __e.TargetDomainName, first(__e.TargetUserSid, __e.TargetSid)); }
+  function subjectUser() { return mkUser(__e.SubjectUserName, __e.SubjectDomainName, __e.SubjectUserSid); }
+  function cleanIp(ip) {
+    var s = nv(ip);
+    if (s == null) return null;
+    if (s.indexOf(':') >= 0) return s;
+    if (/^[0-9.]+$/.test(s)) return s;
+    return null;
+  }
+  function portOf(p) { var n = num(p); return (n != null && n > 0 && n < 65536) ? n : null; }
+
+  var F = {};
+  function setClass(uid, aId, aName) { F.class_uid = uid; F.activity_id = aId; F.activity_name = aName; }
+  function setStatus(sid) { F.status_id = sid; F.status = ({ 0: 'Unknown', 1: 'Success', 2: 'Failure', 99: 'Other' })[sid]; }
+  function auditOutcome() {
+    var k = String(__e.Keywords || '').toLowerCase();
+    if (k.indexOf('failure') >= 0) return 2;
+    if (k.indexOf('success') >= 0) return 1;
+    return null;
+  }
+  function setUser(u) { if (u) { F.user_name = u.name; F.user_domain = u.domain; F.user_uid = u.uid; F.user_type_id = u.type_id; F.user_type = u.type; } }
+  function setActor(u, pName, pPid) {
+    if (u) { F.actor_user_name = u.name; F.actor_user_uid = u.uid; }
+    if (pName != null) F.actor_process_name = basename(pName);
+    if (pPid != null) F.actor_process_pid = pPid;
+  }
+  function setProcess(pid, path, extra) {
+    var n = num(pid);
+    F.process_pid = (n === 0 ? null : n);
+    F.process_name = basename(path);
+    F.process_path = nv(path);
+    if (extra) {
+      if (extra.guid) F.process_guid = extra.guid;
+      if (extra.cmd) F.process_cmd_line = extra.cmd;
+      if (extra.user) F.process_user_name = extra.user.name;
+    }
+  }
+  function setParentProcess(pid, path) {
+    F.parent_process_pid = num(pid);
+    F.parent_process_name = basename(path);
+    F.parent_process_path = nv(path);
+  }
+  function setEndpoint(prefix, ip, port, hostname) {
+    F[prefix + '_ip'] = cleanIp(ip);
+    F[prefix + '_port'] = portOf(port);
+    F[prefix + '_hostname'] = nv(hostname);
+  }
+
+  function mapAuthentication() {
+    var ACT = {
+      4624: [1, 'Logon'], 4625: [1, 'Logon'], 4648: [1, 'Logon'], 4778: [1, 'Logon'],
+      4634: [2, 'Logoff'], 4647: [2, 'Logoff'], 4779: [2, 'Logoff'],
+      4768: [3, 'Authentication Ticket'], 4772: [3, 'Authentication Ticket'],
+      4769: [4, 'Service Ticket Request'], 4773: [4, 'Service Ticket Request'],
+      4770: [5, 'Service Ticket Renew'], 4771: [6, 'Preauth'], 4776: [99, 'Credential Validation'],
+    };
+    var a = ACT[EID] || [99, 'Other'];
+    setClass(3002, a[0], a[1]);
+    var tu = targetUser(), su = subjectUser();
+    setUser(tu || su);
+    setActor(su, __e.ProcessName, num(first(__e.ProcessId, __e.ProcessID)));
+    var lt = num(__e.LogonType);
+    if (lt != null) {
+      var LT = {
+        0: [1, 'System'], 2: [2, 'Interactive'], 3: [3, 'Network'], 4: [4, 'Batch'], 5: [5, 'OS Service'], 7: [7, 'Unlock'],
+        8: [8, 'Network Cleartext'], 9: [9, 'New Credentials'], 10: [10, 'Remote Interactive'], 11: [11, 'Cached Interactive'],
+        12: [12, 'Cached Remote Interactive'], 13: [13, 'Cached Unlock'],
+      };
+      var L = LT[lt] || [99, String(lt)];
+      F.logon_type_id = L[0]; F.logon_type = L[1];
+    }
+    var sessUid = lid(first(__e.TargetLogonId, __e.SubjectLogonId));
+    if (sessUid) F.session_uid = sessUid;
+    setEndpoint('src', first(__e.IpAddress, __e.ClientAddress), __e.IpPort, first(__e.WorkstationName, __e.Workstation, __e.ClientName));
+    setEndpoint('dst', null, null, __e.Computer);
+    if (EID === 4625 || EID === 4771 || EID === 4772 || EID === 4773) setStatus(2);
+    else setStatus(auditOutcome() || 1);
+  }
+
+  function mapAccountChange() {
+    var ACT = {
+      4720: [1, 'Create'], 4741: [1, 'Create'], 4722: [2, 'Enable'], 4723: [3, 'Password Change'],
+      4724: [4, 'Password Reset'], 4725: [5, 'Disable'], 4726: [6, 'Delete'], 4743: [6, 'Delete'],
+      4740: [9, 'Lock'], 4767: [12, 'Unlock'], 4738: [99, 'Account Modified'], 4742: [99, 'Account Modified'], 4781: [99, 'Account Renamed'],
+    };
+    var a = ACT[EID] || [99, 'Account Modified'];
+    setClass(3001, a[0], a[1]);
+    setUser(targetUser());
+    setActor(subjectUser(), null, null);
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapGroupManagement() {
+    var CREATE = [4727, 4731, 4744, 4749, 4754, 4759], ADD = [4728, 4732, 4746, 4751, 4756, 4761],
+      REMOVE = [4729, 4733, 4747, 4752, 4757, 4762], DEL = [4730, 4734, 4748, 4753, 4758, 4763];
+    var a = CREATE.indexOf(EID) >= 0 ? [6, 'Create'] : ADD.indexOf(EID) >= 0 ? [3, 'Add User']
+      : REMOVE.indexOf(EID) >= 0 ? [4, 'Remove User'] : DEL.indexOf(EID) >= 0 ? [5, 'Delete'] : [99, 'Group Modified'];
+    setClass(3006, a[0], a[1]);
+    F.group_name = nv(__e.TargetUserName) || 'Unknown';
+    F.group_domain = nv(__e.TargetDomainName);
+    F.group_uid = first(__e.TargetSid, __e.TargetUserSid);
+    var mu = mkUser(__e.MemberName, null, __e.MemberSid);
+    if (mu) setUser(mu);
+    setActor(subjectUser(), null, null);
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapUserAccess() {
+    setClass(3005, EID === 4704 ? 1 : 2, EID === 4704 ? 'Assign Privileges' : 'Revoke Privileges');
+    setUser(mkUser(null, null, first(__e.TargetSid, __e.TargetUserSid)) || targetUser());
+    setActor(subjectUser(), null, null);
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapAuthorizeSession() {
+    setClass(3003, 1, 'Assign Privileges');
+    setUser(subjectUser());
+    var sid = lid(__e.SubjectLogonId);
+    if (sid) F.session_uid = sid;
+    setEndpoint('dst', null, null, __e.Computer);
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapProcess() {
+    if (isSysmon) {
+      if (EID === 1) {
+        setClass(1007, 1, 'Launch');
+        setProcess(__e.ProcessId, __e.Image, { guid: guidv(__e.ProcessGuid), cmd: nv(__e.CommandLine), user: mkUser(__e.User) });
+        setParentProcess(__e.ParentProcessId, __e.ParentImage);
+      } else if (EID === 5) {
+        setClass(1007, 2, 'Terminate');
+        setProcess(__e.ProcessId, __e.Image, { guid: guidv(__e.ProcessGuid), user: mkUser(__e.User) });
+      } else if (EID === 8) {
+        setClass(1007, 4, 'Inject');
+        setProcess(__e.TargetProcessId, __e.TargetImage, { guid: guidv(__e.TargetProcessGuid) });
+      } else if (EID === 10) {
+        setClass(1007, 3, 'Open');
+        setProcess(__e.TargetProcessId, __e.TargetImage, { guid: guidv(__e.TargetProcessGuid) });
+      } else if (EID === 25) {
+        setClass(1007, 99, 'Process Tampering');
+        setProcess(__e.ProcessId, __e.Image, { guid: guidv(__e.ProcessGuid) });
+      }
+    } else if (EID === 4688) {
+      setClass(1007, 1, 'Launch');
+      setProcess(__e.NewProcessId, __e.NewProcessName, { cmd: nv(__e.CommandLine), user: targetUser() || subjectUser() });
+      setParentProcess(__e.ProcessId, __e.ParentProcessName);
+      setActor(subjectUser(), __e.ParentProcessName, num(__e.ProcessId));
+    } else if (EID === 4689) {
+      setClass(1007, 2, 'Terminate');
+      setProcess(__e.ProcessId, __e.ProcessName, { user: subjectUser() });
+      setActor(subjectUser(), null, null);
+    }
+    if (!isSysmon) setStatus(auditOutcome() || 1);
+  }
+
+  function mapNetwork() {
+    if (isSysmon) {
+      setClass(4001, 1, 'Open');
+      var initiated = String(nv(__e.Initiated) || '').toLowerCase() === 'true';
+      setEndpoint('src', __e.SourceIp, __e.SourcePort, __e.SourceHostname);
+      setEndpoint('dst', __e.DestinationIp, __e.DestinationPort, __e.DestinationHostname);
+      F.connection_direction_id = initiated ? 2 : 1;
+      F.connection_direction = initiated ? 'Outbound' : 'Inbound';
+      var pn = String(nv(__e.Protocol) || '').toLowerCase();
+      if (pn) F.connection_protocol_name = pn;
+      setActor(mkUser(__e.User), __e.Image, num(__e.ProcessId));
+    } else {
+      var WFP = { 5156: [1, 'Open'], 5157: [5, 'Refuse'], 5152: [5, 'Refuse'], 5154: [7, 'Listen'], 5155: [7, 'Listen'], 5158: [99, 'Bind'], 5159: [99, 'Bind'] };
+      var w = WFP[EID] || [99, 'Other'];
+      setClass(4001, w[0], w[1]);
+      var dir = String(nv(__e.Direction) || '').toLowerCase();
+      if (dir === 'inbound') { F.connection_direction_id = 1; F.connection_direction = 'Inbound'; }
+      else if (dir === 'outbound') { F.connection_direction_id = 2; F.connection_direction = 'Outbound'; }
+      setEndpoint('src', __e.SourceAddress, __e.SourcePort, null);
+      setEndpoint('dst', __e.DestAddress, __e.DestPort, null);
+      var pnum = num(__e.Protocol);
+      if (pnum != null) F.connection_protocol_num = pnum;
+      setActor(null, __e.Application, num(first(__e.ProcessID, __e.ProcessId)));
+      setStatus(auditOutcome() || 1);
+    }
+  }
+
+  function mapDns() {
+    setClass(4003, 6, 'Traffic');
+    F.query_hostname = nv(__e.QueryName) || 'unknown';
+    var qr = nv(__e.QueryResults);
+    if (qr) {
+      var parts = qr.split(';').map(function (s) { return s.trim(); }).filter(Boolean);
+      if (parts.length) F.answers_json = JSON.stringify(parts);
+    }
+    var qs = num(__e.QueryStatus);
+    if (qs != null) {
+      F.rcode_id = qs === 0 ? 0 : 99;
+      F.rcode = qs === 0 ? 'NoError' : String(qs);
+      setStatus(qs === 0 ? 1 : 2);
+    }
+    setEndpoint('src', null, null, __e.Computer);
+    setActor(mkUser(__e.User), __e.Image, num(__e.ProcessId));
+  }
+
+  function fileActivityFromMask(mask) {
+    if (mask == null) return [99, 'Other'];
+    if (mask & 0x10000) return [4, 'Delete'];
+    if (mask & 0x6) return [3, 'Update'];
+    if (mask & 0x1) return [2, 'Read'];
+    return [99, 'Other'];
+  }
+  function regActivityFromMask(mask) {
+    if (mask == null) return [99, 'Other'];
+    if (mask & 0x10000) return [4, 'Delete'];
+    if (mask & 0x4) return [1, 'Create'];
+    if (mask & 0x2) return [3, 'Modify'];
+    if (mask & 0x19) return [2, 'Read'];
+    return [99, 'Other'];
+  }
+
+  function mapObjectAccess() {
+    var objType = String(nv(__e.ObjectType) || '').toLowerCase();
+    var mask = num(__e.AccessMask);
+    if (objType === 'key') {
+      var ra = regActivityFromMask(mask);
+      setClass(201001, ra[0], ra[1]);
+      F.reg_key_path = nv(__e.ObjectName) || 'unknown';
+    } else {
+      var fa = EID === 4656 ? [14, 'Open'] : fileActivityFromMask(mask);
+      setClass(1001, fa[0], fa[1]);
+      F.file_path = nv(__e.ObjectName) || 'unknown';
+      F.file_name = basename(__e.ObjectName);
+    }
+    setActor(subjectUser(), __e.ProcessName, num(first(__e.ProcessId, __e.ProcessID)));
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapRegistryValue4657() {
+    var op = String(nv(__e.OperationType) || '').toLowerCase();
+    var ra = (op.indexOf('created') >= 0 || op === '%%1904') ? [2, 'Set'] : (op.indexOf('deleted') >= 0 || op === '%%1906') ? [4, 'Delete'] : [3, 'Modify'];
+    setClass(201002, ra[0], ra[1]);
+    var keyPath = nv(__e.ObjectName) || 'unknown';
+    var vname = nv(__e.ObjectValueName) || '(Default)';
+    F.reg_value_path = keyPath + String.fromCharCode(92) + vname;
+    F.reg_value_name = vname;
+    F.reg_value_data = nv(__e.NewValue);
+    setActor(subjectUser(), __e.ProcessName, num(first(__e.ProcessId, __e.ProcessID)));
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapSysmonFileOrRegistry() {
+    setActor(mkUser(__e.User), __e.Image, num(__e.ProcessId));
+    if (EID === 11 || EID === 15) {
+      setClass(1001, 1, 'Create');
+      F.file_path = nv(__e.TargetFilename); F.file_name = basename(__e.TargetFilename);
+    } else if (EID === 23 || EID === 26) {
+      setClass(1001, 4, 'Delete');
+      F.file_path = nv(__e.TargetFilename); F.file_name = basename(__e.TargetFilename); F.file_is_deleted = true;
+    } else if (EID === 2) {
+      setClass(1001, 6, 'Set Attributes');
+      F.file_path = nv(__e.TargetFilename); F.file_name = basename(__e.TargetFilename);
+    } else if (EID === 12 || EID === 13 || EID === 14) {
+      var et = String(nv(__e.EventType) || '').toLowerCase();
+      var target = nv(__e.TargetObject) || 'unknown';
+      var leaf = basename(target) || '(Default)';
+      if (EID === 13 || et === 'setvalue') {
+        setClass(201002, 2, 'Set');
+        F.reg_value_path = target; F.reg_value_name = leaf; F.reg_value_data = nv(__e.Details);
+      } else if (et === 'deletevalue') {
+        setClass(201002, 4, 'Delete');
+        F.reg_value_path = target; F.reg_value_name = leaf;
+      } else if (EID === 14 || et.indexOf('rename') === 0) {
+        setClass(201001, 5, 'Rename');
+        F.reg_key_path = nv(__e.NewName) || target;
+      } else {
+        var ka = et === 'deletekey' ? [4, 'Delete'] : [1, 'Create'];
+        setClass(201001, ka[0], ka[1]);
+        F.reg_key_path = target;
+      }
+    }
+  }
+
+  function mapModule() {
+    setActor(mkUser(__e.User), __e.Image, num(__e.ProcessId));
+    if (EID === 6) {
+      setClass(1002, 1, 'Load');
+      F.file_path = nv(__e.ImageLoaded); F.file_name = basename(__e.ImageLoaded);
+    } else {
+      setClass(1005, 1, 'Load');
+      F.file_path = nv(__e.ImageLoaded); F.file_name = basename(__e.ImageLoaded);
+    }
+  }
+
+  function mapScheduledJob() {
+    var ACT = { 4698: [1, 'Create'], 4699: [3, 'Delete'], 4700: [4, 'Enable'], 4701: [5, 'Disable'], 4702: [2, 'Update'] };
+    var a = ACT[EID] || [99, 'Other'];
+    setClass(1006, a[0], a[1]);
+    F.job_name = nv(__e.TaskName) || 'unknown';
+    setActor(subjectUser(), null, null);
+    setStatus(auditOutcome() || 1);
+  }
+
+  function mapService() {
+    var name, start, acct;
+    if (EID === 7040 || EID === 7045) {
+      setClass(201004, EID === 7040 ? 2 : 1, EID === 7040 ? 'Reconfigure' : 'Create');
+      name = first(__e.param1, __e.ServiceName);
+      start = first(__e.param3, __e.ServiceStartType);
+    } else {
+      setClass(201004, 1, 'Create');
+      name = nv(__e.ServiceName);
+      acct = first(__e.ServiceAccount, __e.AccountName);
+    }
+    F.service_name = name || 'unknown';
+    F.service_cmd_line = first(__e.ServiceFileName, __e.ImagePath);
+    F.service_start_name = acct;
+    setActor(subjectUser(), null, null);
+    if (isSecurity) setStatus(auditOutcome() || 1);
+  }
+
+  function mapEventLog() {
+    var ACT = { 1102: [1, 'Clear'], 104: [1, 'Clear'], 1100: [7, 'Stop'] };
+    var a = ACT[EID] || [99, 'Other'];
+    setClass(1008, a[0], a[1]);
+    F.log_name = EID === 104 ? (nv(__e.Channel) || nv(__e.LogName) || 'System') : 'Security';
+    F.log_provider = nv(__e.Provider_Name) || 'Microsoft-Windows-Eventlog';
+    setActor(subjectUser(), null, null);
+    setStatus(1);
+  }
+
+  function mapScript() {
+    setClass(1009, 1, 'Execute');
+    var path = nv(__e.Path);
+    F.script_content = __e.ScriptBlockText == null ? '' : String(__e.ScriptBlockText);
+    F.script_name = path ? basename(path) : null;
+    F.script_path = path;
+    setActor(mkUser(null, null, first(__e.UserID, __e.Security_UserID)), null, num(first(__e.ProcessID, __e.Execution_ProcessID)));
+  }
+
+  var AUTH = [4624, 4625, 4634, 4647, 4648, 4768, 4769, 4770, 4771, 4772, 4773, 4776, 4778, 4779];
+  var ACCT = [4720, 4722, 4723, 4724, 4725, 4726, 4738, 4740, 4741, 4742, 4743, 4767, 4781];
+  var GROUP_IDS = [4727, 4728, 4729, 4730, 4731, 4732, 4733, 4734, 4735, 4737,
+    4744, 4745, 4746, 4747, 4748, 4749, 4750, 4751, 4752, 4753, 4754, 4755, 4756, 4757, 4758,
+    4759, 4760, 4761, 4762, 4763];
+  var mapped = true;
+  if (isSysmon) {
+    if ([1, 5, 8, 10, 25].indexOf(EID) >= 0) mapProcess();
+    else if (EID === 3) mapNetwork();
+    else if (EID === 22) mapDns();
+    else if ([2, 11, 12, 13, 14, 15, 23, 26].indexOf(EID) >= 0) mapSysmonFileOrRegistry();
+    else if (EID === 6 || EID === 7) mapModule();
+    else mapped = false;
+  } else if (isSecurity) {
+    var objTypeLc = String(nv(__e.ObjectType) || '').toLowerCase();
+    if (AUTH.indexOf(EID) >= 0) mapAuthentication();
+    else if (ACCT.indexOf(EID) >= 0) mapAccountChange();
+    else if (GROUP_IDS.indexOf(EID) >= 0) mapGroupManagement();
+    else if (EID === 4704 || EID === 4705) mapUserAccess();
+    else if (EID === 4672) mapAuthorizeSession();
+    else if (EID === 4688 || EID === 4689) mapProcess();
+    else if ([5152, 5154, 5155, 5156, 5157, 5158, 5159].indexOf(EID) >= 0) mapNetwork();
+    else if ((EID === 4656 || EID === 4663 || EID === 4670) && (objTypeLc === 'file' || objTypeLc === 'key')) mapObjectAccess();
+    else if (EID === 4657) mapRegistryValue4657();
+    else if (EID >= 4698 && EID <= 4702) mapScheduledJob();
+    else if (EID === 4697) mapService();
+    else if (EID === 1102 || EID === 1100) mapEventLog();
+    else mapped = false;
+  } else if (isSystemChan && (EID === 7045 || EID === 7040)) {
+    mapService();
+  } else if (isSystemChan && EID === 104) {
+    mapEventLog();
+  } else if (isPowerShell && (EID === 4104 || EID === 4103)) {
+    mapScript();
+  } else {
+    mapped = false;
+  }
+  if (!mapped) {
+    F.class_uid = 0; F.activity_id = 99;
+    F.activity_name = 'Windows Event ' + ((EID !== EID) ? 'Unknown' : String(EID));
+    var ao = auditOutcome();
+    if (ao) setStatus(ao);
+  }
+
+  // System/EventData fields every class can type (packtester audit 2026-10-12:
+  // these were the bulk of the Windows packs' unmapped carry). Class-specific
+  // ones only where the class has the attribute.
+  F.event_uid = nv(__e.EventRecordID);
+  F.device_hostname = nv(__e.Computer);
+  F.status_code = nv(__e.Status);
+  F.status_detail = first(__e.SubStatus, __e.FailureReason);
+  if (F.actor_user_name || F.actor_user_uid || nv(__e.SubjectUserName)) F.actor_user_domain = nv(__e.SubjectDomainName);
+  F.actor_session_uid = nv(__e.SubjectLogonId);
+  F.actor_process_tid = num(__e.ThreadID);
+  if (F.actor_process_pid == null) F.actor_process_pid = num(__e.ProcessID);
+  if (F.class_uid === 3002) {
+    F.auth_protocol = nv(__e.AuthenticationPackageName);
+    F.logon_process_name = nv(__e.LogonProcessName);
+  }
+  if (F.class_uid === 3003 || F.class_uid === 3005 || F.class_uid === 3006) {
+    var privs = nv(__e.PrivilegeList) ? String(__e.PrivilegeList).split(/\\s+/).filter(Boolean) : [];
+    if (privs.length) F.privileges_json = JSON.stringify(privs);
+  }
+
+  var fkeys = Object.keys(F);
+  var typed = {};
+  for (var fi = 0; fi < fkeys.length; fi++) {
+    var fk = fkeys[fi];
+    var fv = F[fk];
+    if (fv !== undefined && fv !== null && fv !== '') { __e['__ocsf_' + fk] = fv; typed[String(fv)] = 1; }
+  }
+
+  // unmapped carries what the dispatcher did NOT type: a source field whose value
+  // landed in an attribute verbatim is not repeated (short values like '2' are
+  // too ambiguous to match), nor are the fields the mapping reads directly.
+  var EXCLUDE = { _raw: 1, _time: 1, host: 1, source: 1, sourcetype: 1, index: 1, cribl_breaker: 1, cribl_pipe: 1,
+    EventID: 1, event_code: 1, Channel: 1, log_time: 1 };
+  if (nv(__e.log_time)) typed[String(__e.log_time)] = 1;   // time / metadata.original_time
+  if (F.logon_type_id != null) { EXCLUDE.LogonType = 1; EXCLUDE.logon_type = 1; }
+  var FED = { EventRecordID: 'event_uid', Computer: 'device_hostname', Status: 'status_code', SubStatus: 'status_detail',
+    ThreadID: 'actor_process_tid', SubjectLogonId: 'actor_session_uid', SubjectDomainName: 'actor_user_domain',
+    AuthenticationPackageName: 'auth_protocol', LogonProcessName: 'logon_process_name', PrivilegeList: 'privileges_json' };
+  var fedKeys = Object.keys(FED);
+  for (var di = 0; di < fedKeys.length; di++) if (F[FED[fedKeys[di]]] != null) EXCLUDE[fedKeys[di]] = 1;
+  var um = {};
+  var ekeys = Object.keys(__e);
+  for (var ei = 0; ei < ekeys.length; ei++) {
+    var ek = ekeys[ei];
+    if (ek.indexOf('__') === 0 || EXCLUDE[ek]) continue;
+    var ev2 = __e[ek];
+    if (ev2 == null || ev2 === '') continue;
+    if (typeof ev2 != 'object' && String(ev2).trim().length >= 3 && typed[String(ev2).trim()]) continue;
+    um[ek] = ev2;
+  }
+  __e.__ocsf_unmapped_json = JSON.stringify(um);
+} catch (dispatchErr) {
+  __e.__ocsf_class_uid = 0;
+  __e.__ocsf_activity_id = 0;
+  __e.__ocsf_dispatch_error = String(dispatchErr);
+}
+`;
+
+/** Every flat `__ocsf_*` field name `WINDOWS_OCSF_DISPATCH_JS` can produce, for `getParserFieldNames`. */
+export const WINDOWS_OCSF_DISPATCH_FIELDS: string[] = [
+  '__ocsf_class_uid', '__ocsf_activity_id', '__ocsf_activity_name', '__ocsf_status_id', '__ocsf_status',
+  '__ocsf_user_name', '__ocsf_user_domain', '__ocsf_user_uid', '__ocsf_user_type_id', '__ocsf_user_type',
+  '__ocsf_actor_user_name', '__ocsf_actor_user_uid', '__ocsf_actor_process_name', '__ocsf_actor_process_pid',
+  '__ocsf_process_pid', '__ocsf_process_name', '__ocsf_process_path', '__ocsf_process_cmd_line', '__ocsf_process_guid', '__ocsf_process_user_name',
+  '__ocsf_parent_process_pid', '__ocsf_parent_process_name', '__ocsf_parent_process_path',
+  '__ocsf_logon_type_id', '__ocsf_logon_type', '__ocsf_session_uid',
+  '__ocsf_src_ip', '__ocsf_src_port', '__ocsf_src_hostname', '__ocsf_dst_ip', '__ocsf_dst_port', '__ocsf_dst_hostname',
+  '__ocsf_connection_direction_id', '__ocsf_connection_direction', '__ocsf_connection_protocol_name', '__ocsf_connection_protocol_num',
+  '__ocsf_query_hostname', '__ocsf_rcode_id', '__ocsf_rcode', '__ocsf_answers_json',
+  '__ocsf_file_path', '__ocsf_file_name', '__ocsf_file_is_deleted',
+  '__ocsf_reg_key_path', '__ocsf_reg_value_path', '__ocsf_reg_value_name', '__ocsf_reg_value_data',
+  '__ocsf_group_name', '__ocsf_group_domain', '__ocsf_group_uid',
+  '__ocsf_job_name',
+  '__ocsf_service_name', '__ocsf_service_cmd_line', '__ocsf_service_start_name',
+  '__ocsf_log_name', '__ocsf_log_provider',
+  '__ocsf_script_content', '__ocsf_script_name', '__ocsf_script_path',
+  '__ocsf_event_uid', '__ocsf_device_hostname', '__ocsf_status_code', '__ocsf_status_detail',
+  '__ocsf_actor_user_domain', '__ocsf_actor_session_uid', '__ocsf_actor_process_tid',
+  '__ocsf_auth_protocol', '__ocsf_logon_process_name', '__ocsf_privileges_json',
+  '__ocsf_unmapped_json', '__ocsf_dispatch_error',
+];
+
+/**
+ * Every class_uid `WINDOWS_OCSF_DISPATCH_JS` can assign (0 = Base Event, its
+ * fall-through for an EventID it has no class for). The OCSF class audit grades
+ * a per-event-dispatched output against this set rather than one key's class;
+ * tests/windows-ocsf-dispatch-test.mjs pins it to the dispatcher's setClass calls.
+ */
+export const WINDOWS_OCSF_DISPATCH_CLASSES: number[] = [
+  0, 1001, 1002, 1005, 1006, 1007, 1008, 1009, 3001, 3002, 3003, 3005, 3006, 4001, 4003,
+  201001, 201002, 201004,
+];
+
+/** The shared extraction-stage `code` function — appended after each Windows channel's existing alias eval. */
+export function windowsOcsfDispatchFn(): PipelineFunction {
+  return {
+    id: 'code',
+    description: 'Dispatch this Windows/Sysmon/PowerShell event to its OCSF 1.9 class (ported from Simon\'s Windows_Events_to_OCSF pipeline) and keep everything else in __ocsf_unmapped_json',
+    conf: { maxNumOfIterations: 5000, code: WINDOWS_OCSF_DISPATCH_JS },
+  };
+}
+
+const hasWindowsOcsfDispatch = (fns: PipelineFunction[]) =>
+  fns.some(fn => fn && fn.id === 'code' && String((fn.conf as { code?: unknown } | undefined)?.code || '').includes('__ocsf_class_uid'));
+
+/**
+ * Append the OCSF class dispatcher to a non-static extraction (a golden part, an
+ * AI parse) for a channel whose built-in parser carries it. The `ocsf@windows_*`
+ * mapping reads only the `__ocsf_*` fields it writes, so an extraction golden
+ * minted before the dispatcher existed (the classic-text Security / PowerShell
+ * parts) would otherwise map every event to an empty class.
+ */
+export function withWindowsOcsfDispatch(sourcetypeRaw: string, fns: PipelineFunction[]): PipelineFunction[] {
+  if (!fns.length || hasWindowsOcsfDispatch(fns)) return fns;
+  if (!hasWindowsOcsfDispatch(getParserForSourcetype(sourcetypeRaw, true))) return fns;
+  return [...fns, windowsOcsfDispatchFn()];
+}
 
 /**
  * Canonical Windows Event-Log channels + PowerShell — the families where code
@@ -2365,6 +3427,21 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
         },
         {
           id: 'regex_extract',
+          filter: "msg_body && (msg_body.indexOf('Message-ID') >= 0 || msg_body.indexOf(' bytes from') >= 0 || msg_body.indexOf('policy') >= 0)",
+          description: 'Parse Message-ID header, message size and mail policy',
+          conf: {
+            source: 'msg_body',
+            // The Message-ID header is the message's identity outside this
+            // appliance; the MID is only this ESA's internal id for it.
+            regex: "/Message-ID\\s+'(?<message_id>[^']+)'/",
+            regexList: [
+              { regex: '/ready\\s+(?<message_size>\\d+)\\s+bytes/' },
+              { regex: '/per-recipient policy\\s+(?<mail_policy>\\S+)/' },
+            ],
+          },
+        },
+        {
+          id: 'regex_extract',
           filter: "msg_body && msg_body.indexOf('interim verdict') >= 0 || msg_body && msg_body.indexOf('using engine') >= 0",
           description: 'Parse anti-spam verdict (engine + verdict)',
           conf: {
@@ -2430,7 +3507,6 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
           conf: {
             add: [
               { name: 'severity', value: "level == 'Critical' ? 'critical' : level == 'Warning' ? 'medium' : level == 'Info' ? 'informational' : level == 'Debug' ? 'low' : undefined" },
-              { name: 'message_id', value: 'mid || undefined' },
               { name: 'session_id', value: 'dcid || icid || undefined' },
               { name: 'src_user', value: 'sender || undefined' },
               { name: 'user', value: 'sender || undefined' },
@@ -2440,7 +3516,6 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
               { name: 'vendor_product', value: "'Cisco Email Security Appliance'" },
               { name: 'signature', value: 'filter_rule || av_name || undefined' },
               { name: 'src', value: 'src_ip || tls_peer_cn || undefined' },
-              { name: 'host', value: "'cisco-esa'" },
             ],
           },
         },
@@ -2822,20 +3897,34 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
       return cefKeyDictionaryFunctions();
 
     case 'windows_powershell':
+      // Two wire forms of one channel: the classic Splunk-rendered text
+      // (`LogName=… EventCode=…`, WinEventLog:) and Windows Event XML
+      // (XmlWinEventLog:). The first eval records which one the event is, and every
+      // later function is gated on it, so an event runs only its own branch: the
+      // classic regexes never scan an XML body, and the XML front-end never
+      // touches a text line. `__ps_xml` is internal (Cribl drops `__` fields).
       return [
+        {
+          id: 'eval',
+          description: 'Mark Windows Event XML (XmlWinEventLog) apart from the classic text form',
+          conf: { add: [{ name: '__ps_xml', value: "/^\\s*<Event[\\s>]/.test(_raw)" }] },
+        },
         {
           id: 'regex_extract',
           description: 'Extract timestamp and structured fields from PowerShell log',
+          filter: '!__ps_xml',
           conf: { source: '_raw', regex: '/^(?<log_time>\\d{1,2}\\/\\d{1,2}\\/\\d{4}\\s+\\d{1,2}:\\d{2}:\\d{2}\\s+[AP]M)\\s+LogName=(?<LogName>\\S+)\\s+SourceName=(?<SourceName>\\S+)\\s+EventCode=(?<EventCode>\\d+)\\s+EventType=(?<EventType>\\d+)\\s+Type=(?<Type>\\w+)\\s+ComputerName=(?<ComputerName>\\S+)\\s+User=(?<User>\\S+)/' },
         },
         {
           id: 'regex_extract',
           description: 'Extract Sid, TaskCategory and Message',
+          filter: '!__ps_xml',
           conf: { source: '_raw', regex: '/Sid=(?<Sid>\\S+).*?TaskCategory=(?<TaskCategory>[^\\s](?:[^\\n]*?))\\s+OpCode=.*?Message=(?<Message>[\\s\\S]*)/' },
         },
         {
           id: 'eval',
           description: 'Alias PowerShell fields to canonical names',
+          filter: '!__ps_xml',
           conf: {
             add: [
               { name: 'host', value: 'ComputerName || undefined' },
@@ -2850,6 +3939,32 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
             ],
           },
         },
+        ...windowsXmlFrontEnd('Windows PowerShell').map(fn => ({ ...fn, filter: '__ps_xml' })),
+        {
+          id: 'eval',
+          description: 'Alias PowerShell XML fields to canonical names',
+          filter: '__ps_xml',
+          conf: {
+            add: [
+              { name: 'log_time', value: 'SystemTime || TimeCreated_SystemTime || undefined' },
+              { name: 'host', value: 'Computer || undefined' },
+              { name: 'event_code', value: 'EventID || undefined' },
+              // 4103 carries the account and host application only inside
+              // ContextInfo (`User = ACME\jdoe`), whose line breaks the front-end
+              // has turned into commas. Security/UserID is a SID, not a name.
+              { name: 'user', value: "ContextInfo ? (String(ContextInfo).match(/(?:^|,)\\s*User = ([^,]+)/) || [])[1] : undefined" },
+              { name: 'user_id', value: 'UserID || Security_UserID || undefined' },
+              { name: 'command', value: "ScriptBlockText || (ContextInfo ? (String(ContextInfo).match(/Host Application = ([^,]+)/) || [])[1] : undefined) || undefined" },
+              { name: 'file_path', value: 'Path || undefined' },
+              { name: 'process_id', value: 'ProcessID || Execution_ProcessID || undefined' },
+              { name: 'signature', value: "EventID == '4103' ? 'PowerShell pipeline execution' : EventID == '4104' ? 'PowerShell script block' : EventID == '4105' ? 'PowerShell script block started' : EventID == '4106' ? 'PowerShell script block stopped' : undefined" },
+              { name: 'severity', value: WINDOWS_LEVEL_TO_SEVERITY },
+              { name: 'app', value: "'PowerShell'" },
+              { name: 'vendor_product', value: "'Microsoft Windows'" },
+            ],
+          },
+        },
+        windowsOcsfDispatchFn(),
       ];
 
     case 'windows_security':
@@ -2908,6 +4023,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
             ],
           },
         },
+        windowsOcsfDispatchFn(),
       ];
 
     case 'windows_dns_client':
@@ -2953,6 +4069,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
             ],
           },
         },
+        windowsOcsfDispatchFn(),
       ];
 
     case 'windows_defender':
@@ -2988,6 +4105,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
             ],
           },
         },
+        windowsOcsfDispatchFn(),
       ];
 
     case 'windows_system':
@@ -2997,9 +4115,11 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
       // envelope plus the handful of EventData names Service Control Manager uses
       // and keeps everything else in `message` rather than inventing a model.
       return [
-        ...windowsXmlFrontEnd('Windows System'),
+        ...windowsAlternateWires(),
+        ...windowsXmlFrontEnd('Windows System').map(fn => ({ ...fn, filter: '__win_xml' })),
         {
           id: 'eval',
+          filter: '__win_xml',
           description: 'Alias Windows System channel fields to canonical names',
           conf: {
             add: [
@@ -3024,6 +4144,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
             ],
           },
         },
+        windowsOcsfDispatchFn(),
       ];
 
     case 'windows_application':
@@ -3033,9 +4154,11 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
       // payload as `message`. Its data class is deliberately `generic`: pretending
       // this is an endpoint or authentication feed is precisely the bug being fixed.
       return [
-        ...windowsXmlFrontEnd('Windows Application'),
+        ...windowsAlternateWires(),
+        ...windowsXmlFrontEnd('Windows Application').map(fn => ({ ...fn, filter: '__win_xml' })),
         {
           id: 'eval',
+          filter: '__win_xml',
           description: 'Alias Windows Application channel fields to canonical names',
           conf: {
             add: [
@@ -3125,6 +4248,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
             ],
           },
         },
+        windowsOcsfDispatchFn(),
       ];
 
     case 'sap_audit':
@@ -3271,6 +4395,10 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
               // TCODE/activity is the message-variable field; REPORT is the ABAP program.
               { name: 'app', value: 'rec && (rec.var_data || rec.dialog) || undefined' },
               { name: 'report', value: 'rec && rec.program || undefined' },
+              // kept even when app took var_data, so no decoded slot is dropped.
+              { name: 'dialog_type', value: 'rec && rec.dialog || undefined' },
+              // SAP client (MANDT) from the record header.
+              { name: 'sap_client', value: 'rec && rec.mandt || undefined' },
               // SAP message id as event code; message = id + variable substitution text.
               { name: 'event_code', value: 'rec && rec.msg_id || undefined' },
               { name: 'message', value: 'rec ? (String(rec.msg_id || "") + (rec.var_data ? " " + String(rec.var_data) : "")) : undefined' },
@@ -3280,6 +4408,8 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
               { name: 'severity', value: "rec && rec.msg_id == 'AU2' ? 3 : (rec && (rec.msg_id == 'AU1' || rec.msg_id == 'AU3') ? 6 : 5)" },
               // timestamp: YYYYMMDDHHMMSS, no tz in source → treat as UTC.
               { name: 'log_time', value: "rec && rec.ts ? Date.parse(rec.ts.slice(0,4)+'-'+rec.ts.slice(4,6)+'-'+rec.ts.slice(6,8)+'T'+rec.ts.slice(8,10)+':'+rec.ts.slice(10,12)+':'+rec.ts.slice(12,14)+'Z') : undefined" },
+              // every record carries its own time; without this all records of a file share the ingest time.
+              { name: '_time', value: "rec && rec.ts ? Date.parse(rec.ts.slice(0,4)+'-'+rec.ts.slice(4,6)+'-'+rec.ts.slice(6,8)+'T'+rec.ts.slice(8,10)+':'+rec.ts.slice(10,12)+':'+rec.ts.slice(12,14)+'Z') / 1000 : _time" },
             ],
             remove: ['sap_records', 'rec'],
           },
@@ -3336,10 +4466,10 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
       return [
         {
           id: 'regex_extract',
-          description: 'Parse syslog header (timestamp, host, process, pid, message)',
+          description: 'Parse syslog header (priority, timestamp, host, process, pid, message)',
           conf: {
             source: '_raw',
-            regex: '/^(?<log_time>\\w+\\s+\\d+\\s+[\\d:]+)\\s+(?<host>\\S+)\\s+(?<process>[^\\[:]+)(?:\\[(?<pid>\\d+)\\])?:\\s+(?<message>.+)$/',
+            regex: '/^(?:<(?<syslog_pri>\\d+)>)?(?<log_time>\\w+\\s+\\d+\\s+[\\d:]+)\\s+(?<host>\\S+)\\s+(?<process>[^\\[:]+)(?:\\[(?<pid>\\d+)\\])?:\\s+(?<message>.+)$/',
           },
         },
         {
@@ -3374,6 +4504,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
           description: 'Normalize linux syslog fields to canonical model',
           conf: {
             add: [
+              { name: 'log_time', value: RFC3164_LOG_TIME_WITH_YEAR },
               { name: 'app', value: 'process || undefined' },
               { name: 'vendor_product', value: "'Linux'" },
               { name: 'severity', value: "action === 'Failed' || action === 'Invalid' || action === 'BLOCK' ? 4 : 6" },
@@ -3533,8 +4664,12 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
           conf: {
             source: '_raw',
             // The device IP is an OPTIONAL extra token between hostname and
-            // process (present on some relay configurations).
-            regex: '/^<(?<priority>\\d+)>(?<syslog_timestamp>\\w{3}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?<host>\\S+)(?:\\s+(?<device_ip>\\d+\\.\\d+\\.\\d+\\.\\d+))?\\s+(?<process>[A-Za-z_][\\w-]*)\\[(?<pid>\\d+)\\]:\\s+(?<message>.*)$/',
+            // process (present on some relay configurations). So are the PRI
+            // (absent once a relay or file tail strips it) and a facility word
+            // (`daemon`, from NIOS's ISO-timestamp syslog), and the timestamp is
+            // BSD (with or without a year) or ISO 8601. Requiring `<PRI>` + BSD
+            // read none of the three shipped reference lines.
+            regex: '/^(?:<(?<priority>\\d+)>)?(?<syslog_timestamp>\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?(?:Z|[+-]\\d{2}:?\\d{2})?|\\w{3}\\s+\\d{1,2}(?:\\s+\\d{4})?\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?:(?:kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|authpriv|ftp|local[0-7])\\s+)?(?<host>\\S+)(?:\\s+(?<device_ip>\\d+\\.\\d+\\.\\d+\\.\\d+))?\\s+(?<process>[A-Za-z_][\\w-]*)\\[(?<pid>\\d+)\\]:\\s+(?<message>.*)$/',
           },
         },
         {
@@ -3543,7 +4678,12 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
           description: 'Parse a named DNS query line (client, transport, query, response code)',
           conf: {
             source: 'message',
-            regex: '/^(?<dns_time>\\d{1,2}-\\w{3}-\\d{4}\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?)\\s+client\\s+(?<src_ip>\\S+?)#(?<src_port>\\d+)\\s+(?<transport_raw>\\w+):\\s+query:\\s+(?<query>\\S+)\\s+(?<query_class>\\w+)\\s+(?<query_type>\\w+)(?:\\s+response:\\s+(?<reply_code>\\w+))?/',
+            // Both named forms: the BIND query log (`info queries: client IP#port
+            // (qname): query: qname IN A +E (server)`) and the Infoblox responses
+            // log (`infoblox-responses: <time> client IP#port: UDP: query: … response:
+            // NOERROR`). The category prefix, payload time, `@0x…` client handle,
+            // `(qname)` echo and transport are each optional.
+            regex: '/^(?:(?:\\w+\\s+)?[\\w-]+:\\s+)?(?:(?<dns_time>\\d{1,2}-\\w{3}-\\d{4}\\s+\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?)\\s+)?client\\s+(?:@0x[0-9a-f]+\\s+)?(?<src_ip>[^\\s#]+)#(?<src_port>\\d+)(?:\\s+\\([^)]*\\))?:\\s+(?:(?<transport_raw>[A-Za-z]+):\\s+)?query:\\s+(?<query>\\S+)\\s+(?<query_class>\\w+)\\s+(?<query_type>\\w+)(?:\\s+response:\\s+(?<reply_code>\\w+))?(?:\\s+[+-][A-Z]*)?(?:\\s+\\((?<dns_server>[^)]+)\\))?/',
           },
         },
         {
@@ -3564,13 +4704,14 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
               // syslog header has no year, so it is only the fallback. Rule 8.
               { name: 'log_time', value: 'dns_time ? Date.parse(dns_time) / 1000 : syslog_timestamp ? Date.parse(syslog_timestamp) / 1000 : undefined' },
               { name: 'src_port', value: 'src_port != null ? Number(src_port) : undefined' },
-              { name: 'dest_port', value: "transport_raw ? 53 : undefined" },
+              { name: 'dest_port', value: "transport_raw || query ? 53 : undefined" },
               { name: 'transport', value: 'transport_raw ? String(transport_raw).toLowerCase() : undefined' },
               { name: 'protocol', value: 'transport_raw ? String(transport_raw).toLowerCase() : undefined' },
               // NOERROR is an allowed answer; every other RCODE (REFUSED,
               // NXDOMAIN, SERVFAIL) is a denied/failed one.
               { name: 'action', value: "reply_code ? (reply_code === 'NOERROR' ? 'allowed' : 'blocked') : dhcp_action ? 'allowed' : undefined" },
-              { name: 'dest_ip', value: 'lease_ip || undefined' },
+              // The query log names the answering server last, `(10.0.0.1)`.
+              { name: 'dest_ip', value: 'lease_ip || dns_server || undefined' },
               { name: 'src_mac', value: 'src_mac || undefined' },
               { name: 'src_host', value: 'client_host || undefined' },
               { name: 'url', value: 'query || undefined' },
@@ -3591,21 +4732,71 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
 
     // Canonical name is `aws_vpc_v5` (see SOURCETYPE_ALIASES) — the switch
     // canonicalizes BEFORE it dispatches, so this used to be keyed on the alias
-    // `aws_vpc_flow` and was unreachable dead code. What actually ran was the
-    // Cribl Search datatype parser, a `csv` serde with no `fields` and no
-    // delimiter override: VPC flow records are SPACE-separated, so a comma CSV
-    // parse yields one column and the golden mapper got nothing (0/1 fields).
-    // v2 and v5 share the same 14-token default record layout.
+    // `aws_vpc_flow` and was unreachable dead code.
+    //
+    // ONE source, several record layouts (packtester audit 2026-10-09: 1 of 8
+    // events fully parsed). The default formats v2, v5 and the all-fields ECS one
+    // are PREFIXES of one AWS field order (14 / 29 / 39-40 fields), so one regex
+    // with nested optional tails reads all three. Transit Gateway and the
+    // AWS-docs v3 custom layout have their own order and their own branch. A
+    // CloudWatch `{"message":"…"}` envelope is unwrapped first, and `-` (no
+    // value, e.g. a NODATA record) is accepted in every position and then
+    // removed — it used to fail the `\d+` captures, or become port/bytes 0.
     case 'aws_vpc_v5':
-    case 'aws_vpc_v2':
+    case 'aws_vpc_v2': {
+      const g = (names: string[]) => names.map(n => `\\s+(?<${n}>\\S+)`).join('');
+      const DEFAULT_HEAD = ['account_id', 'interface_id', 'src_ip', 'dest_ip', 'src_port', 'dest_port', 'ip_protocol',
+        'packets', 'bytes', 'start', 'end', 'action', 'log_status'];
+      const V5_TAIL = ['vpc_id', 'subnet_id', 'instance_id', 'tcp_flags', 'traffic_type', 'pkt_src_ip', 'pkt_dest_ip',
+        'region', 'az_id', 'sublocation_type', 'sublocation_id', 'pkt_src_aws_service', 'pkt_dst_aws_service',
+        'direction', 'traffic_path'];
+      const ECS_TAIL = ['ecs_cluster_arn', 'ecs_cluster_name', 'ecs_container_instance_arn', 'ecs_container_instance_id',
+        'ecs_container_id', 'ecs_second_container_id', 'ecs_service_name', 'ecs_task_definition_arn', 'ecs_task_arn',
+        'ecs_task_id'];
+      const TGW = ['resource_type', 'account_id', 'tgw_id', 'tgw_attachment_id', 'tgw_src_vpc_account_id',
+        'tgw_dst_vpc_account_id', 'tgw_src_vpc_id', 'tgw_dst_vpc_id', 'tgw_src_subnet_id', 'tgw_dst_subnet_id',
+        'tgw_src_eni', 'tgw_dst_eni', 'tgw_src_az_id', 'tgw_dst_az_id', 'tgw_pair_attachment_id', 'src_ip', 'dest_ip',
+        'src_port', 'dest_port', 'ip_protocol', 'packets', 'bytes', 'start', 'end', 'log_status', 'traffic_type',
+        'packets_lost_no_route', 'packets_lost_blackhole', 'packets_lost_mtu_exceeded', 'packets_lost_ttl_expired',
+        'tcp_flags', 'region', 'direction', 'pkt_src_aws_service', 'pkt_dst_aws_service'];
+      const V3_CUSTOM = ['vpc_id', 'subnet_id', 'instance_id', 'interface_id', 'account_id', 'traffic_type', 'src_ip',
+        'dest_ip', 'src_port', 'dest_port', 'pkt_src_ip', 'pkt_dest_ip', 'ip_protocol', 'bytes', 'packets', 'start',
+        'end', 'action', 'tcp_flags', 'log_status'];
+      const TGW_RE = '^\\s*\\d+\\s+\\S+\\s+\\d{12}\\s+tgw-';
+      const V3_RE = '^\\s*\\d+\\s+vpc-';
+      const strings = [...new Set([...DEFAULT_HEAD, ...V5_TAIL, ...ECS_TAIL, 'reject_reason', ...TGW, ...V3_CUSTOM])];
       return [
         {
           id: 'regex_extract',
-          description: 'Parse VPC Flow log fields (v2/v5 default record layout)',
+          description: 'Unwrap a CloudWatch Logs {"message":"…"} envelope',
+          conf: { source: '_raw', regex: '/^\\s*\\{.*?"message"\\s*:\\s*"(?<__vpc_msg>[^"]*)"/' },
+        },
+        { id: 'eval', description: 'The flow record to parse', conf: { add: [{ name: '__vpc', value: '__vpc_msg || _raw' }] } },
+        {
+          id: 'regex_extract',
+          filter: `/${TGW_RE}/.test(__vpc)`,
+          description: 'Parse a Transit Gateway flow record',
+          conf: { source: '__vpc', regex: `/^\\s*(?<version>\\d+)${g(TGW)}/` },
+        },
+        {
+          id: 'regex_extract',
+          filter: `/${V3_RE}/.test(__vpc)`,
+          description: 'Parse the v3 custom layout (vpc-id first)',
+          conf: { source: '__vpc', regex: `/^\\s*(?<version>\\d+)${g(V3_CUSTOM)}/` },
+        },
+        {
+          id: 'regex_extract',
+          filter: `!/${TGW_RE}|${V3_RE}/.test(__vpc)`,
+          description: 'Parse the default record: v2 (14 fields), v5 (29) or all fields with ECS (39-40)',
           conf: {
-            source: '_raw',
-            regex: '/^(?<version>\\d+)\\s+(?<account_id>\\d+)\\s+(?<interface_id>\\S+)\\s+(?<src_ip>\\S+)\\s+(?<dest_ip>\\S+)\\s+(?<src_port>\\d+)\\s+(?<dest_port>\\d+)\\s+(?<ip_protocol>\\d+)\\s+(?<packets>\\d+)\\s+(?<bytes>\\d+)\\s+(?<start>\\d+)\\s+(?<end>\\d+)\\s+(?<action>\\w+)\\s+(?<log_status>\\w+)/',
+            source: '__vpc',
+            regex: `/^\\s*(?<version>\\d+)${g(DEFAULT_HEAD)}(?:${g(V5_TAIL)}(?:${g(ECS_TAIL)}(?:${g(['reject_reason'])})?)?)?/`,
           },
+        },
+        {
+          id: 'eval',
+          description: 'A "-" is no value: remove it rather than read it as 0',
+          conf: { add: strings.map(n => ({ name: n, value: `${n} === '-' ? undefined : ${n}` })), remove: ['__vpc', '__vpc_msg'] },
         },
         {
           id: 'eval',
@@ -3628,9 +4819,15 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
               { name: 'bytes_out', value: 'bytes != null ? Number(bytes) : undefined' },
               { name: 'packets', value: 'packets != null ? Number(packets) : undefined' },
               { name: 'packets_out', value: 'packets != null ? Number(packets) : undefined' },
+              { name: 'tcp_flags', value: 'tcp_flags != null ? Number(tcp_flags) : undefined' },
               { name: 'action', value: "action === 'ACCEPT' ? 'allowed' : action === 'REJECT' ? 'blocked' : action ? String(action).toLowerCase() : undefined" },
               // The ENI is the only device identity a flow record has.
-              { name: 'dev_id', value: 'interface_id || undefined' },
+              { name: 'dev_id', value: 'interface_id || tgw_src_eni || undefined' },
+              // Cloud context, read by the OCSF `cloud` object.
+              { name: 'cloud_provider', value: "'AWS'" },
+              { name: 'cloud_account_id', value: 'account_id || undefined' },
+              { name: 'cloud_region', value: 'region || undefined' },
+              { name: 'cloud_zone', value: 'az_id || undefined' },
               { name: 'vendor', value: "'AWS'" },
               { name: 'product', value: "'VPC Flow Logs'" },
               { name: 'vendor_product', value: "'AWS VPC Flow Logs'" },
@@ -3638,6 +4835,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
           },
         },
       ];
+    }
 
     case 'apache_access':
     case 'nginx_access': {
@@ -3973,6 +5171,470 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
         },
       ];
 
+    case 'juniper_srx':
+      // RFC5424 structured syslog. The 5-tuple lives in the SD parameters
+      // (`source-address="…"`), not in the message body. Named captures skip
+      // the hyphenated SD keys, which cleanFields would rename and which a
+      // jsExpression cannot read as `source-address`.
+      return [
+        {
+          id: 'regex_extract',
+          description: 'Extract the Juniper SRX RFC5424 envelope',
+          conf: {
+            source: '_raw',
+            regex: '/^<\\d+>\\d+\\s+(?<log_time>\\S+)\\s+(?<host>\\S+)\\s+(?<process>\\S+)/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract Juniper SRX session addresses and ports',
+          conf: {
+            source: '_raw',
+            regex: '/source-address="(?<src_ip>[^"]+)"\\s+source-port="(?<src_port>[^"]+)"[\\s\\S]*?destination-address="(?<dest_ip>[^"]+)"\\s+destination-port="(?<dest_port>[^"]+)"/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the Juniper SRX protocol name',
+          conf: { source: '_raw', regex: '/protocol-name="(?<transport>[^"]+)"/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the Juniper SRX service or application',
+          conf: { source: '_raw', regex: '/(?:service-name|application(?:-name)?)="(?<app>[^"]+)"/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the Juniper SRX policy or attack name',
+          conf: { source: '_raw', regex: '/(?:policy-name|attack-name)="(?<action>[^"]+)"/' },
+        },
+        {
+          id: 'eval',
+          description: 'Tag Juniper SRX events with their vendor',
+          conf: {
+            add: [
+              { name: 'vendor', value: "'Juniper'" },
+              { name: 'product', value: "'SRX'" },
+              { name: 'vendor_product', value: "'Juniper SRX'" },
+            ],
+          },
+        },
+      ];
+
+    case 'sophos_xg':
+      return [
+        {
+          id: 'serde',
+          description: 'Parse Sophos XG key=value fields',
+          conf: { mode: 'extract', type: 'kvp', srcField: '_raw', delimChar: ' ', quoteChar: '"', cleanFields: true },
+        },
+        {
+          id: 'eval',
+          description: 'Alias Sophos XG fields to the canonical network model',
+          conf: {
+            add: [
+              { name: 'dest_ip', value: 'dst_ip || dst || undefined' },
+              { name: 'src_port', value: 'src_port || undefined' },
+              { name: 'dest_port', value: 'dst_port || undefined' },
+              { name: 'user', value: 'user_name || user || undefined' },
+              { name: 'action', value: 'log_subtype || status || undefined' },
+              { name: 'log_time', value: "timestamp ? timestamp : (date && time ? date + 'T' + time : undefined)" },
+              { name: 'transport', value: 'protocol || undefined' },
+              { name: 'app', value: 'log_component || log_type || undefined' },
+              { name: 'bytes_in', value: 'recv_bytes || bytes_received || undefined' },
+              { name: 'bytes_out', value: 'sent_bytes || bytes_sent || undefined' },
+              { name: 'host', value: 'device_name || undefined' },
+              { name: 'signature', value: 'log_subtype || message || undefined' },
+              { name: 'vendor', value: "'Sophos'" },
+              { name: 'product', value: "'XG Firewall'" },
+              { name: 'vendor_product', value: "'Sophos XG Firewall'" },
+            ],
+          },
+        },
+      ];
+
+    case 'sonicwall_firewall':
+      // `src` and `dst` are `ip:port:zone`, not bare addresses.
+      return [
+        {
+          id: 'serde',
+          description: 'Parse SonicWall key=value fields',
+          conf: { mode: 'extract', type: 'kvp', srcField: '_raw', delimChar: ' ', quoteChar: '"', cleanFields: true },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Split SonicWall src=ip:port:zone',
+          conf: { source: 'src', regex: '/(?<src_ip>\\d{1,3}(?:\\.\\d{1,3}){3}):(?<src_port>\\d+)/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Split SonicWall dst=ip:port:zone',
+          conf: { source: 'dst', regex: '/(?<dest_ip>\\d{1,3}(?:\\.\\d{1,3}){3}):(?<dest_port>\\d+)/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Take the transport from proto=tcp/https',
+          conf: { source: 'proto', regex: '/^(?<transport>[a-z0-9]+)/i' },
+        },
+        {
+          id: 'eval',
+          description: 'Alias SonicWall fields to the canonical network model',
+          conf: {
+            add: [
+              { name: 'log_time', value: 'time || undefined' },
+              { name: 'action', value: 'fw_action || msg || undefined' },
+              { name: 'bytes_in', value: 'rcvd || undefined' },
+              { name: 'bytes_out', value: 'sent || undefined' },
+              { name: 'user', value: 'usr || undefined' },
+              { name: 'host', value: 'fw || undefined' },
+              { name: 'message', value: 'msg || undefined' },
+              { name: 'vendor', value: "'SonicWall'" },
+              { name: 'product', value: "'Firewall'" },
+              { name: 'vendor_product', value: "'SonicWall Firewall'" },
+            ],
+          },
+        },
+      ];
+
+    case 'pfsense':
+      return [
+        {
+          id: 'regex_extract',
+          description: 'Parse a BSD-syslog pfSense header',
+          conf: {
+            source: '_raw',
+            regex: '/^<\\d+>(?<log_time>\\w{3}\\s+\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2})\\s+(?<process>[^\\s\\[:]+)(?:\\[(?<pid>\\d+)\\])?:\\s+(?<message>.*)$/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Parse an RFC5424 pfSense header',
+          conf: {
+            source: '_raw',
+            regex: '/^<\\d+>1\\s+(?<log_time>\\S+)\\s+(?<host>\\S+)\\s+(?<process>\\S+)\\s+\\S+\\s+\\S+\\s+(?<message>.*)$/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Parse a filterlog IPv4 5-tuple',
+          conf: {
+            source: 'message',
+            regex: '/,(?<action>block|pass|reject),(?<direction>in|out),\\d+,(?:[^,]*,){7}(?<transport>tcp|udp|icmp|igmp|esp),\\d+,(?<src_ip>\\d{1,3}(?:\\.\\d{1,3}){3}),(?<dest_ip>\\d{1,3}(?:\\.\\d{1,3}){3}),(?<src_port>\\d+),(?<dest_port>\\d+)/',
+          },
+        },
+        {
+          id: 'eval',
+          description: 'Tag pfSense events with their vendor',
+          conf: {
+            add: [
+              { name: 'app', value: 'process || undefined' },
+              { name: 'vendor', value: "'Netgate'" },
+              { name: 'product', value: "'pfSense'" },
+              { name: 'vendor_product', value: "'Netgate pfSense'" },
+            ],
+          },
+        },
+      ];
+
+    case 'linux_secure':
+      return [
+        {
+          id: 'regex_extract',
+          description: 'Parse the syslog header of a secure-log line',
+          conf: {
+            source: '_raw',
+            regex: '/^(?:<(?<syslog_pri>\\d+)>)?(?<log_time>\\w+\\s+\\d+\\s+[\\d:]+)\\s+(?<host>\\S+)\\s+(?<process>[^\\[:]+)(?:\\[(?<pid>\\d+)\\])?:\\s+(?<message>.+)$/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract sshd Accepted/Failed fields',
+          conf: {
+            source: 'message',
+            regex: '/(?<action>Accepted|Failed|Invalid)\\s+(?<auth_method>\\S+)\\s+for\\s+(?:invalid user\\s+)?(?<user>\\S+)\\s+from\\s+(?<src_ip>[\\d.]+)\\s+port\\s+(?<src_port>\\d+)/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract a sudo command',
+          conf: {
+            source: 'message',
+            regex: '/(?<user>\\S+)\\s+:\\s+.*?USER=(?<runas_user>\\S+)\\s*;\\s*COMMAND=(?<command>.+)/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the account from a pam session line',
+          conf: {
+            source: 'message',
+            regex: '/session opened for user (?<user>\\S+)/',
+          },
+        },
+        {
+          id: 'eval',
+          description: 'Alias secure-log fields to the canonical authentication model',
+          conf: {
+            add: [
+              { name: 'log_time', value: RFC3164_LOG_TIME_WITH_YEAR },
+              { name: 'app', value: 'process || undefined' },
+              { name: 'event_code', value: 'process || undefined' },
+              { name: 'dest_port', value: "process == 'sshd' ? 22 : undefined" },
+              { name: 'action', value: "action == 'Accepted' ? 'success' : action == 'Failed' || action == 'Invalid' ? 'failure' : action || undefined" },
+              { name: 'severity', value: "action == 'Failed' || action == 'Invalid' || action == 'failure' ? 4 : 6" },
+              { name: 'vendor', value: "'Linux'" },
+              { name: 'product', value: "'Secure Log'" },
+              { name: 'vendor_product', value: "'Linux Secure Log'" },
+            ],
+          },
+        },
+      ];
+
+    case 'cisco_umbrella':
+      // CSV rows. The opening quote of field 1 is optional: Umbrella's S3 export
+      // keeps it (`"2020-07-23 23:48:56","…`), an older shipped sample had it
+      // stripped. DNS rows have two identity columns before the internal IP;
+      // proxy rows have the internal IP as field 2.
+      return [
+        {
+          id: 'regex_extract',
+          description: 'Extract the leading Umbrella timestamp (every CSV shape shares it)',
+          conf: {
+            source: '_raw',
+            regex: '/^"?(?:\\d+","\\s*)?(?<log_time>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the first IPv4 in an Umbrella row',
+          conf: { source: '_raw', regex: '/(?<src_ip>\\d{1,3}(?:\\.\\d{1,3}){3})/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Parse a Cisco Umbrella DNS CSV row',
+          conf: {
+            source: '_raw',
+            regex: '/^"?(?<log_time>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})","(?<identity>[^"]*)","(?<identities>[^"]*)","(?<src_ip>\\d{1,3}(?:\\.\\d{1,3}){3})","(?<external_ip>[^"]*)","(?<action>[^"]*)","(?<query_type>[^"]*)","(?<reply_code>[^"]*)","(?<query>[^"]*)"/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Parse a Cisco Umbrella proxy CSV row',
+          conf: {
+            source: '_raw',
+            regex: '/^"?(?<log_time>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})","(?<identity>[^"]*)","(?<src_ip>\\d{1,3}(?:\\.\\d{1,3}){3})","(?<external_ip>[^"]*)","(?<dest_ip>[^"]*)","[^"]*","(?<action>[^"]*)","(?<url>https?:[^"]*)"/',
+          },
+        },
+        {
+          id: 'eval',
+          description: 'Alias Umbrella fields to the canonical DNS model',
+          conf: {
+            add: [
+              { name: 'user', value: 'identity || undefined' },
+              { name: 'dns_query', value: 'query || undefined' },
+              { name: 'app', value: "query ? 'DNS' : url ? 'Proxy' : 'Umbrella'" },
+              { name: 'vendor', value: "'Cisco'" },
+              { name: 'product', value: "'Umbrella'" },
+              { name: 'vendor_product', value: "'Cisco Umbrella'" },
+            ],
+          },
+        },
+      ];
+
+    case 'leef':
+      // LEEF 1.0 separates attributes with a tab. LEEF 2.0 names the delimiter
+      // (`xA6` → U+00A6) in the header. Normalise that one character to a tab
+      // and let one kvp serde read both. The header regex also tolerates the
+      // syslog prefix the stock datatype (`^LEEF:`) misses.
+      return [
+        {
+          id: 'regex_extract',
+          description: 'Extract the LEEF header, with or without a syslog prefix',
+          conf: {
+            source: '_raw',
+            regex: '/LEEF:(?<leef_version>[\\d.]+)\\|(?<device_vendor>[^|]*)\\|(?<device_product>[^|]*)\\|(?<device_version>[^|]*)\\|(?<signature_id>[^|]*)\\|(?:x[0-9A-Fa-f]{2}\\|)?(?<leef_payload>[\\s\\S]*)$/',
+          },
+        },
+        {
+          id: 'eval',
+          description: 'Normalise the LEEF 2.0 broken-bar delimiter to a tab',
+          conf: {
+            add: [
+              { name: '__leef_body', value: "leef_payload ? leef_payload.replace(/\\u00a6/g, '\\t') : leef_payload" },
+            ],
+          },
+        },
+        {
+          id: 'serde',
+          description: 'Parse LEEF extension pairs',
+          conf: { mode: 'extract', type: 'kvp', srcField: '__leef_body', delimChar: '\t', cleanFields: true },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Lift common LEEF address pairs to canonical names',
+          conf: {
+            source: '_raw',
+            regex: '/(?:offender_ip|src)=(?<src_ip>\\d{1,3}(?:\\.\\d{1,3}){3})/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Lift the LEEF destination address',
+          conf: {
+            source: '_raw',
+            regex: '/(?:victim_ip|dst)=(?<dest_ip>\\d{1,3}(?:\\.\\d{1,3}){3})/',
+          },
+        },
+        {
+          id: 'eval',
+          description: 'Alias LEEF header fields to the canonical model',
+          conf: {
+            add: [
+              { name: 'vendor', value: 'device_vendor || undefined' },
+              { name: 'product', value: 'device_product || undefined' },
+              { name: 'vendor_product', value: 'device_vendor && device_product ? device_vendor + " " + device_product : device_vendor || device_product || undefined' },
+              { name: 'event_code', value: 'signature_id || undefined' },
+              { name: 'signature', value: 'title || signature_id || undefined' },
+              { name: 'log_time', value: 'devTime || EventReceivedTime || undefined' },
+              { name: 'host', value: 'hostname || identHostName || undefined' },
+              { name: 'user', value: 'usrName || undefined' },
+            ],
+          },
+        },
+      ];
+
+    case 'okta_system':
+      return [
+        { id: 'serde', description: 'Parse Okta System Log JSON', conf: { mode: 'extract', type: 'json', srcField: '_raw' } },
+        {
+          id: 'eval',
+          description: 'Alias Okta System Log fields to the canonical authentication model',
+          conf: {
+            add: [
+              { name: 'log_time', value: 'published || undefined' },
+              { name: 'event_code', value: 'eventType || undefined' },
+              { name: 'signature', value: 'displayMessage || eventType || undefined' },
+              { name: 'action', value: 'outcome.result || undefined' },
+              { name: 'user', value: 'actor.alternateId || undefined' },
+              { name: 'user_id', value: 'actor.id || undefined' },
+              { name: 'src_ip', value: 'client.ipAddress || undefined' },
+              { name: 'user_agent', value: 'client.userAgent.rawUserAgent || undefined' },
+              { name: 'vendor', value: "'Okta'" },
+              { name: 'product', value: "'System Log'" },
+              { name: 'vendor_product', value: "'Okta System Log'" },
+            ],
+          },
+        },
+      ];
+
+    case 'o365_management_activity':
+      return [
+        { id: 'serde', description: 'Parse Microsoft 365 Management Activity JSON', conf: { mode: 'extract', type: 'json', srcField: '_raw' } },
+        {
+          id: 'eval',
+          description: 'Alias Office 365 audit fields to the canonical cloud-audit model',
+          conf: {
+            add: [
+              { name: 'log_time', value: 'CreationTime || undefined' },
+              { name: 'user', value: 'UserId || MailboxOwnerUPN || undefined' },
+              { name: 'src_ip', value: 'ClientIP || ClientIPAddress || ActorIpAddress || undefined' },
+              { name: 'action', value: 'Operation || undefined' },
+              { name: 'outcome', value: 'ResultStatus || undefined' },
+              { name: 'app', value: 'Workload || undefined' },
+              { name: 'event_code', value: 'RecordType || undefined' },
+              { name: 'event_uid', value: 'Id || undefined' },
+              { name: 'vendor', value: "'Microsoft'" },
+              { name: 'product', value: "'Office 365 Management Activity'" },
+              { name: 'vendor_product', value: "'Microsoft Office 365 Management Activity'" },
+            ],
+          },
+        },
+      ];
+
+    case 'barracuda_cloudgen_firewall':
+      // Two JSON shapes share this sourcetype: threat events (`src_ip`/`dst_ip`/
+      // `operation`) and traffic events (`source_ip`/`destination_ip`/`action`).
+      return [
+        { id: 'serde', description: 'Parse Barracuda CloudGen Firewall JSON', conf: { mode: 'extract', type: 'json', srcField: '_raw' } },
+        {
+          id: 'eval',
+          description: 'Alias Barracuda CloudGen fields to the canonical network model',
+          conf: {
+            add: [
+              { name: 'src_ip', value: 'src_ip || source_ip || undefined' },
+              { name: 'dest_ip', value: 'dst_ip || destination_ip || undefined' },
+              { name: 'src_port', value: 'src_port || source_port || undefined' },
+              { name: 'dest_port', value: 'port || destination_port || dst_port || undefined' },
+              { name: 'action', value: 'operation || action || undefined' },
+              { name: 'log_time', value: 'timestamp || undefined' },
+              { name: 'transport', value: 'trans_proto || undefined' },
+              { name: 'user', value: 'user || undefined' },
+              { name: 'url', value: 'name || undefined' },
+              { name: 'signature', value: 'description || undefined' },
+              { name: 'app', value: 'component || undefined' },
+              { name: 'vendor', value: "'Barracuda'" },
+              { name: 'product', value: "'CloudGen Firewall'" },
+              { name: 'vendor_product', value: "'Barracuda CloudGen Firewall'" },
+            ],
+          },
+        },
+      ];
+
+    case 'cisco_sfw_estreamer':
+      // One reference line is missing its opening `{` (it still ends in `}`), so
+      // JSON.parse rejects it. The regexes read the same keys off the text.
+      return [
+        {
+          id: 'regex_extract',
+          description: 'Extract eStreamer initiator, responder, protocol and action from the text',
+          conf: {
+            source: '_raw',
+            regex: '/"InitiatorIP"\\s*:\\s*"(?<src_ip>[^"]+)"/',
+          },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the eStreamer responder address',
+          conf: { source: '_raw', regex: '/"ResponderIP"\\s*:\\s*"(?<dest_ip>[^"]+)"/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the eStreamer protocol',
+          conf: { source: '_raw', regex: '/"Protocol"\\s*:\\s*"(?<transport>[^"]+)"/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the eStreamer rule action',
+          conf: { source: '_raw', regex: '/"AC_RuleAction"\\s*:\\s*"(?<action>[^"]+)"/' },
+        },
+        {
+          id: 'regex_extract',
+          description: 'Extract the eStreamer event time',
+          conf: { source: '_raw', regex: '/"(?:FirstPacketSecond|EventSecond)"\\s*:\\s*(?<log_time>\\d+)/' },
+        },
+        { id: 'serde', description: 'Parse Cisco Secure Firewall eStreamer JSON', conf: { mode: 'extract', type: 'json', srcField: '_raw' } },
+        {
+          id: 'eval',
+          description: 'Alias eStreamer connection fields to the canonical network model',
+          conf: {
+            add: [
+              { name: 'src_ip', value: 'InitiatorIP || undefined' },
+              { name: 'dest_ip', value: 'ResponderIP || undefined' },
+              { name: 'src_port', value: 'InitiatorPort || undefined' },
+              { name: 'dest_port', value: 'ResponderPort || undefined' },
+              { name: 'transport', value: 'Protocol || undefined' },
+              { name: 'action', value: 'AC_RuleAction || undefined' },
+              // log_time is the digit string the regex captured. FirstPacketSecond
+              // is a JSON number; copying it would replace that string.
+              { name: 'signature', value: 'EventType || undefined' },
+              { name: 'session_id', value: 'ConnectionID || undefined' },
+              { name: 'vendor', value: "'Cisco'" },
+              { name: 'product', value: "'Secure Firewall'" },
+              { name: 'vendor_product', value: "'Cisco Secure Firewall'" },
+            ],
+          },
+        },
+      ];
+
     default: {
       // Fallback 1: a Cribl Search stock-datatype parser (100+ vendors/variants).
       const dtp = resolveDatatypeParser(sourcetypeRaw);
@@ -4089,9 +5751,10 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'src_ip', 'reverse_dns', 'dns_verified', 'interface', 'sender', 'recipient',
         'subject', 'spam_verdict', 'av_verdict', 'action',
         'filter_rule', 'dkim_domain', 'dkim_result', 'tls_peer_cn', 'category',
+        'message_id', 'message_size', 'mail_policy',
         // Alias eval produces these CIM Email canonical fields:
-        'severity', 'message_id', 'session_id', 'src_user', 'dest_user', 'user',
-        'app', 'vendor_product', 'signature', 'src', 'host',
+        'severity', 'session_id', 'src_user', 'dest_user', 'user',
+        'app', 'vendor_product', 'signature', 'src',
         // `mail_size` and `protocol` were declared here but no stage produces
         // them. `protocol` is READ by the golden CIM spec, so declaring it told
         // the mapping AI to map a field that is always empty.
@@ -4224,7 +5887,8 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'host', 'event_code',
         'app', 'vendor_product', 'action', 'session_id', 'severity',
         'logon_type', 'process', 'process_id', 'src_nt_domain', 'dest_nt_domain',
-        'signature', 'authentication_method'];
+        'signature', 'authentication_method',
+        ...WINDOWS_OCSF_DISPATCH_FIELDS];
     case 'windows_sysmon':
       return ['EventID', 'Computer', 'Level', 'Channel', 'UtcTime',
         'SystemTime', 'TimeCreated_SystemTime', 'log_time',
@@ -4236,7 +5900,8 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'app', 'vendor_product', 'action', 'severity',
         'process', 'process_id', 'process_guid', 'command',
         'parent_process', 'parent_process_id', 'parent_command',
-        'file_path', 'registry_path', 'file_hash', 'dns_query', 'signature'];
+        'file_path', 'registry_path', 'file_hash', 'dns_query', 'signature',
+        ...WINDOWS_OCSF_DISPATCH_FIELDS];
     // Must stay in step with the windows_dns_client/_defender/_system/_application
     // cases in getParserForSourcetype — all four share `windowsXmlFrontEnd`, so the
     // envelope names are identical and only the EventData half differs.
@@ -4248,7 +5913,8 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'host', 'event_code', 'query', 'dns_query', 'url', 'query_type',
         'answer', 'dns_answer', 'dest_ip', 'dest_port', 'transport',
         'reply_code', 'reply_code_id', 'action', 'signature', 'process_id', 'user_id',
-        'severity', 'app', 'vendor', 'product', 'vendor_product'];
+        'severity', 'app', 'vendor', 'product', 'vendor_product',
+        ...WINDOWS_OCSF_DISPATCH_FIELDS];
     case 'windows_defender':
       return ['EventID', 'Computer', 'Level', 'Channel', 'ProcessID', 'UserID',
         'Provider_Name', 'SystemTime', 'TimeCreated_SystemTime', 'log_time',
@@ -4257,27 +5923,43 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'FeatureName', 'ScanID', 'ScanTypeName', 'CurrentSignatureVersion',
         'host', 'hostname', 'event_code', 'signature', 'category', 'severity_name',
         'file_path', 'object', 'user', 'user_id', 'action', 'outcome', 'process_id',
-        'severity', 'app', 'vendor', 'product', 'vendor_product'];
+        'severity', 'app', 'vendor', 'product', 'vendor_product',
+        ...WINDOWS_OCSF_DISPATCH_FIELDS];
     case 'windows_system':
       return ['EventID', 'Computer', 'Level', 'Channel', 'ProcessID', 'UserID',
         'Provider_Name', 'SystemTime', 'TimeCreated_SystemTime', 'log_time',
         'ServiceName', 'ImagePath', 'ServiceType', 'StartType', 'AccountName',
         'param1', 'Data',
+        // Classic text and Cribl Edge JSON (the non-XML branches).
+        'LogName', 'SourceName', 'EventCode', 'EventType', 'Type', 'ComputerName',
+        'NewProcessName', 'CommandLine', 'Id', 'EventId', 'ProviderName', 'MachineName',
+        'TimeCreated', 'Message', 'ProcessId', 'LevelDisplayName',
         'host', 'hostname', 'event_code', 'app', 'process', 'object', 'user',
         'process_id', 'user_id', 'message', 'signature', 'action', 'outcome',
-        'severity', 'vendor', 'product', 'vendor_product'];
+        'command', 'severity', 'vendor', 'product', 'vendor_product',
+        ...WINDOWS_OCSF_DISPATCH_FIELDS];
     case 'windows_application':
       return ['EventID', 'Computer', 'Level', 'Channel', 'ProcessID', 'UserID',
         'Provider_Name', 'SystemTime', 'TimeCreated_SystemTime', 'log_time', 'Data',
+        'LogName', 'SourceName', 'EventCode', 'EventType', 'Type', 'ComputerName',
+        'NewProcessName', 'CommandLine', 'AccountName', 'Id', 'EventId', 'ProviderName',
+        'MachineName', 'TimeCreated', 'Message', 'ProcessId', 'LevelDisplayName',
         'host', 'hostname', 'event_code', 'app', 'message', 'process',
-        'user_id', 'process_id', 'signature', 'outcome',
-        'severity', 'vendor', 'product', 'vendor_product'];
+        'user', 'user_id', 'process_id', 'signature', 'outcome', 'command',
+        'action', 'severity', 'vendor', 'product', 'vendor_product'];
+    // Both branches of the windows_powershell parser: classic text, then XML.
     case 'windows_powershell':
       return ['LogName', 'SourceName', 'EventCode', 'EventType', 'Type',
         'ComputerName', 'User', 'Sid', 'Message', 'TaskCategory',
-        'host', 'user', 'event_code', 'app', 'vendor_product', 'severity', 'action', 'signature'];
+        'EventID', 'Computer', 'Level', 'Channel', 'ProcessID', 'UserID',
+        'Provider_Name', 'SystemTime', 'TimeCreated_SystemTime', 'log_time',
+        'ScriptBlockText', 'ScriptBlockId', 'MessageNumber', 'MessageTotal', 'Path',
+        'ContextInfo', 'Payload', 'RunspaceId',
+        'host', 'user', 'user_id', 'event_code', 'command', 'file_path', 'process_id',
+        'app', 'vendor_product', 'severity', 'action', 'signature',
+        ...WINDOWS_OCSF_DISPATCH_FIELDS];
     case 'linux_syslog':
-      return ['log_time', 'host', 'process', 'pid', 'message',
+      return ['syslog_pri', 'log_time', 'host', 'process', 'pid', 'message',
         'user', 'src_ip', 'src_port', 'dest_ip', 'dest_port', 'transport',
         'auth_method', 'runas_user', 'command', 'action',
         'app', 'vendor_product', 'severity', 'event_code'];
@@ -4338,7 +6020,7 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'log_time', 'src_ip', 'src_port', 'dest_ip', 'dest_port', 'transport', 'protocol',
         'query', 'query_class', 'query_type', 'reply_code', 'url', 'action', 'event_code',
         'signature', 'severity', 'src_mac', 'src_host', 'lease_ip', 'dhcp_action', 'client_host',
-        'via', 'transport_raw', 'dns_time', 'app', 'vendor', 'product', 'vendor_product'];
+        'via', 'transport_raw', 'dns_time', 'dns_server', 'app', 'vendor', 'product', 'vendor_product'];
     // Same story as apache/nginx: keyed on the alias `aws_vpc_flow`, so it fell
     // through to `default:` and declared the datatype parser's single `start`
     // column. Must stay in step with the aws_vpc_v5/v2 parser case.
@@ -4347,7 +6029,62 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
       return ['version', 'account_id', 'interface_id', 'dev_id', 'src_ip', 'dest_ip',
         'src_port', 'dest_port', 'ip_protocol', 'protocol', 'transport', 'packets',
         'packets_out', 'bytes', 'bytes_out', 'start', 'end', 'log_time', 'duration',
-        'action', 'log_status', 'vendor', 'product', 'vendor_product'];
+        'action', 'log_status', 'vpc_id', 'subnet_id', 'instance_id', 'tcp_flags', 'traffic_type',
+        'pkt_src_ip', 'pkt_dest_ip', 'region', 'az_id', 'sublocation_type', 'sublocation_id',
+        'pkt_src_aws_service', 'pkt_dst_aws_service', 'direction', 'traffic_path',
+        'ecs_cluster_arn', 'ecs_cluster_name', 'ecs_container_instance_arn', 'ecs_container_instance_id',
+        'ecs_container_id', 'ecs_second_container_id', 'ecs_service_name', 'ecs_task_definition_arn',
+        'ecs_task_arn', 'ecs_task_id', 'reject_reason', 'resource_type', 'tgw_id', 'tgw_attachment_id',
+        'tgw_src_vpc_account_id', 'tgw_dst_vpc_account_id', 'tgw_src_vpc_id', 'tgw_dst_vpc_id',
+        'tgw_src_subnet_id', 'tgw_dst_subnet_id', 'tgw_src_eni', 'tgw_dst_eni', 'tgw_src_az_id',
+        'tgw_dst_az_id', 'tgw_pair_attachment_id', 'packets_lost_no_route', 'packets_lost_blackhole',
+        'packets_lost_mtu_exceeded', 'packets_lost_ttl_expired',
+        'cloud_provider', 'cloud_account_id', 'cloud_region', 'cloud_zone', 'vendor', 'product', 'vendor_product'];
+    case 'juniper_srx':
+      return ['log_time', 'host', 'process', 'src_ip', 'src_port', 'dest_ip', 'dest_port',
+        'transport', 'app', 'action', 'vendor', 'product', 'vendor_product'];
+    case 'sophos_xg':
+      return ['src_ip', 'dest_ip', 'dst_ip', 'src_port', 'dest_port', 'dst_port', 'user', 'user_name',
+        'action', 'log_subtype', 'status', 'log_time', 'timestamp', 'date', 'time', 'transport',
+        'protocol', 'app', 'log_component', 'log_type', 'bytes_in', 'bytes_out', 'host',
+        'device_name', 'signature', 'message', 'vendor', 'product', 'vendor_product'];
+    case 'sonicwall_firewall':
+      return ['src', 'dst', 'src_ip', 'src_port', 'dest_ip', 'dest_port', 'proto', 'transport',
+        'log_time', 'time', 'action', 'fw_action', 'msg', 'message', 'bytes_in', 'bytes_out',
+        'rcvd', 'sent', 'user', 'usr', 'host', 'fw', 'vendor', 'product', 'vendor_product'];
+    case 'pfsense':
+      return ['log_time', 'host', 'process', 'pid', 'message', 'action', 'direction', 'transport',
+        'src_ip', 'dest_ip', 'src_port', 'dest_port', 'app', 'vendor', 'product', 'vendor_product'];
+    case 'linux_secure':
+      return ['syslog_pri', 'log_time', 'host', 'process', 'pid', 'message', 'action', 'auth_method', 'user',
+        'src_ip', 'src_port', 'runas_user', 'command', 'app', 'event_code', 'dest_port',
+        'severity', 'vendor', 'product', 'vendor_product'];
+    case 'cisco_umbrella':
+      return ['log_time', 'identity', 'identities', 'src_ip', 'external_ip', 'action',
+        'query_type', 'reply_code', 'query', 'dest_ip', 'url', 'user', 'dns_query', 'app',
+        'vendor', 'product', 'vendor_product'];
+    case 'leef':
+      return ['leef_version', 'device_vendor', 'device_product', 'device_version', 'signature_id',
+        'leef_payload', 'src_ip', 'dest_ip', 'vendor', 'product', 'vendor_product', 'event_code',
+        'signature', 'log_time', 'host', 'user'];
+    case 'okta_system':
+      return ['published', 'eventType', 'displayMessage', 'log_time', 'event_code', 'signature',
+        'action', 'user', 'user_id', 'src_ip', 'user_agent', 'vendor', 'product', 'vendor_product'];
+    case 'o365_management_activity':
+      return ['CreationTime', 'UserId', 'MailboxOwnerUPN', 'ClientIP', 'ClientIPAddress',
+        'ActorIpAddress', 'Operation', 'ResultStatus', 'Workload', 'RecordType', 'Id',
+        'log_time', 'user', 'src_ip', 'action', 'outcome', 'app', 'event_code', 'event_uid',
+        'vendor', 'product', 'vendor_product'];
+    case 'barracuda_cloudgen_firewall':
+      return ['src_ip', 'source_ip', 'dest_ip', 'dst_ip', 'destination_ip', 'src_port', 'source_port',
+        'dest_port', 'port', 'destination_port', 'dst_port', 'action', 'operation', 'log_time',
+        'timestamp', 'transport', 'trans_proto', 'user', 'url', 'name', 'signature', 'description',
+        'app', 'component', 'vendor', 'product', 'vendor_product'];
+    case 'cisco_sfw_estreamer':
+      return ['InitiatorIP', 'ResponderIP', 'InitiatorPort', 'ResponderPort', 'Protocol',
+        'AC_RuleAction', 'FirstPacketSecond', 'EventSecond', 'EventType', 'ConnectionID',
+        'src_ip', 'dest_ip', 'src_port', 'dest_port', 'transport', 'action', 'log_time',
+        'signature', 'session_id', 'vendor', 'product', 'vendor_product'];
     default: {
       // Fallback to the Search-datatype parser's field list so the mapping stage
       // stays grounded in what the (datatype) parser actually produces. The
@@ -4378,7 +6115,7 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
 
 export type DataClass =
   | 'network' | 'authentication' | 'endpoint' | 'web_proxy'
-  | 'email' | 'cloud_audit' | 'audit' | 'dns' | 'generic';
+  | 'email' | 'cloud_audit' | 'audit' | 'dns' | 'privilege' | 'generic';
 
 // Sourcetype (canonical) → data class. Unknown sourcetypes fall to 'generic'.
 export const SOURCETYPE_DATACLASS: Record<string, DataClass> = {

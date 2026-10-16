@@ -2,39 +2,8 @@
   "_comment": "Parsers translated from Cribl Search stock datatypes (v1 regexp/kvp/csv + portable v2 JSON serde). Fallback for getParserForSourcetype when no hand-built parser exists. Refresh with scripts/check-datatypes.mjs --apply.",
   "_generated": "2026-08-21T10:09:08.014Z",
   "_source": "default_search/search/datatypes",
-  "count": 183,
+  "count": 187,
   "parsers": {
-    "sap_hana": {
-      "dataFormat": "raw",
-      "functions": [
-        {
-          "id": "comment",
-          "conf": {
-            "comment": "Hand-authored (not from Cribl Search): SAP HANA indexserver/nameserver trace + audit logs. Used by matchDatatypeParserBySample for offline sample recognition of the bracketed [ts][LEVEL][pid][component][source_file][Thread N] head."
-          }
-        },
-        {
-          "id": "regex_extract",
-          "description": "sap_hana_head",
-          "conf": {
-            "source": "_raw",
-            "regex": "/^\\[(?<log_time>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d+)\\]\\[(?<level>\\w+)\\]\\[(?<pid>\\d+)\\]\\[(?<component>[^\\]]+)\\]\\[(?<source_file>[^\\]]+)\\]\\[Thread (?<os_thread>\\d+)\\]\\s*(?<msg_body>.*)$/"
-          }
-        }
-      ],
-      "fields": [
-        "log_time",
-        "level",
-        "pid",
-        "component",
-        "source_file",
-        "os_thread",
-        "msg_body"
-      ],
-      "timeField": "log_time",
-      "searchDatatypeId": "sap_hana",
-      "description": "SAP HANA indexserver/nameserver trace and audit logs"
-    },
     "apache_httpd_accesslog_common": {
       "dataFormat": "raw",
       "functions": [
@@ -5337,61 +5306,6 @@
       "searchDatatypeId": "v2_access_combined",
       "description": "Apache access_combined format for v2 Datatypes"
     },
-    "Pan_Traffic_Fixed": {
-      "dataFormat": "delimited",
-      "functions": [
-        {
-          "id": "comment",
-          "conf": {
-            "comment": "Parser derived from Cribl Search datatype \"Pan_Traffic_Fixed\" (delimited)."
-          }
-        },
-        {
-          "id": "serde",
-          "description": "Parse delimited",
-          "conf": {
-            "mode": "extract",
-            "type": "csv",
-            "srcField": "_raw"
-          }
-        }
-      ],
-      "fields": [
-        "_time"
-      ],
-      "timeField": "_time",
-      "searchDatatypeId": "Pan_Traffic_Fixed",
-      "description": ""
-    },
-    "access_error": {
-      "dataFormat": "raw",
-      "functions": [
-        {
-          "id": "comment",
-          "conf": {
-            "comment": "Parser derived from Cribl Search datatype \"access_error\" (raw)."
-          }
-        },
-        {
-          "id": "regex_extract",
-          "description": "access_error",
-          "conf": {
-            "source": "_raw",
-            "regex": "/^\\[(?<timestamp>[^\\]]+)\\]\\s+\\[(?<module>[^\\]]+)\\]\\s+\\[(?<pidtid>[^\\]]+)\\]\\s+\\[(?<client>[^\\]]+)\\]\\s+(?<message>.*)$/"
-          }
-        }
-      ],
-      "fields": [
-        "log_time",
-        "module",
-        "pidtid",
-        "client",
-        "message"
-      ],
-      "timeField": null,
-      "searchDatatypeId": "access_error",
-      "description": ""
-    },
     "aws_config": {
       "dataFormat": "ndjson",
       "functions": [
@@ -7393,6 +7307,198 @@
       "timeField": "_raw",
       "searchDatatypeId": "zpa_user_status",
       "description": "Zscaler Private Access (ZPA) user status logs in JSON format"
+    },
+    "my-fortinetv2": {
+      "dataFormat": "ndjson",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"my-fortinetv2\" (ndjson)."
+          }
+        },
+        {
+          "id": "serde",
+          "description": "Parse JSON",
+          "conf": {
+            "mode": "extract",
+            "type": "json",
+            "srcField": "_raw"
+          }
+        }
+      ],
+      "fields": [
+        "_time"
+      ],
+      "timeField": "_time",
+      "searchDatatypeId": "my-fortinetv2",
+      "description": "Fortinet FortiGate firewall logs wrapped in a syslog PRI header followed by FortiOS key=value pairs."
+    },
+    "v2_access_error": {
+      "dataFormat": "raw",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"v2_access_error\" (raw)."
+          }
+        },
+        {
+          "id": "regex_extract",
+          "description": "access_error",
+          "conf": {
+            "source": "_raw",
+            "regex": "/^\\[(?<timestamp>[^\\]]+)\\]\\s+\\[(?<module>[^:\\]]+):(?<level>[^\\]]+)\\]\\s+\\[pid\\s+(?<pid>\\d+):tid\\s+(?<tid>\\d+)\\]\\s+\\[client:\\s+(?<client_ip>\\d{1,3}(?:\\.\\d{1,3}){3})\\]\\s+(?<message>.*)$/"
+          }
+        }
+      ],
+      "fields": [
+        "log_time",
+        "module",
+        "severity",
+        "pid",
+        "tid",
+        "client_ip",
+        "message"
+      ],
+      "timeField": null,
+      "searchDatatypeId": "v2_access_error",
+      "description": ""
+    },
+    "pan_traffic_fixed_time": {
+      "dataFormat": "delimited",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"pan_traffic_fixed_time\" (delimited)."
+          }
+        },
+        {
+          "id": "serde",
+          "description": "Parse delimited",
+          "conf": {
+            "mode": "extract",
+            "type": "csv",
+            "srcField": "_raw"
+          }
+        }
+      ],
+      "fields": [
+        "_time"
+      ],
+      "timeField": "_time",
+      "searchDatatypeId": "pan_traffic_fixed_time",
+      "description": ""
+    },
+    "mysql": {
+      "dataFormat": "ndjson",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"mysql\" (ndjson)."
+          }
+        },
+        {
+          "id": "serde",
+          "description": "Parse JSON",
+          "conf": {
+            "mode": "extract",
+            "type": "json",
+            "srcField": "_raw"
+          }
+        },
+        {
+          "id": "serde",
+          "description": "sql",
+          "conf": {
+            "mode": "extract",
+            "type": "kvp",
+            "srcField": "_raw",
+            "delimChar": ",",
+            "pairDelim": "="
+          }
+        }
+      ],
+      "fields": [],
+      "timeField": null,
+      "searchDatatypeId": "mysql",
+      "description": ""
+    },
+    "adventofcodev2": {
+      "dataFormat": "raw",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"adventofcodev2\" (raw)."
+          }
+        },
+        {
+          "id": "regex_extract",
+          "description": "day1",
+          "conf": {
+            "source": "_raw",
+            "regex": "/^(?<direction>\\w)(?<step>\\d+)/"
+          }
+        }
+      ],
+      "fields": [
+        "direction",
+        "step"
+      ],
+      "timeField": null,
+      "searchDatatypeId": "adventofcodev2",
+      "description": ""
+    },
+    "pan_custom_v2": {
+      "dataFormat": "ndjson",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"pan_custom_v2\" (ndjson)."
+          }
+        },
+        {
+          "id": "serde",
+          "description": "Parse JSON",
+          "conf": {
+            "mode": "extract",
+            "type": "json",
+            "srcField": "_raw"
+          }
+        }
+      ],
+      "fields": [],
+      "timeField": null,
+      "searchDatatypeId": "pan_custom_v2",
+      "description": ""
+    },
+    "pan_custom_v2_test1": {
+      "dataFormat": "delimited",
+      "functions": [
+        {
+          "id": "comment",
+          "conf": {
+            "comment": "Parser derived from Cribl Search datatype \"pan_custom_v2_test1\" (delimited)."
+          }
+        },
+        {
+          "id": "serde",
+          "description": "Parse delimited",
+          "conf": {
+            "mode": "extract",
+            "type": "csv",
+            "srcField": "_raw"
+          }
+        }
+      ],
+      "fields": [],
+      "timeField": null,
+      "searchDatatypeId": "pan_custom_v2_test1",
+      "description": ""
     }
   }
 }

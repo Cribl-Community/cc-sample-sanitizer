@@ -479,9 +479,17 @@ export async function fetchSanitisedSample(key: string): Promise<SanitisedSample
   return (await response.json()).sample || null;
 }
 
+/**
+ * Inside Cribl, a sanitised-sample write that only reached the browser is not a success: the
+ * iframe's storage is per-tab memory (localStorage throws there), so the sample is gone on the
+ * next reload. Callers show this as a warning instead of "saved".
+ */
+export const SANITISED_BROWSER_ONLY_WARNING =
+  'App storage did not accept the write, so it is kept only in this browser tab and will be lost on reload. Download the sample to keep a copy.';
+
 export async function saveSanitisedSample(
   doc: SanitisedSampleDoc,
-): Promise<{ ok: boolean; storedIn: 'config' | 'app-kv' | 'browser'; error?: string }> {
+): Promise<{ ok: boolean; storedIn: 'config' | 'app-kv' | 'browser'; error?: string; warning?: string }> {
   if (getRunMode() === 'iframe') {
     const safeDoc = parseSanitisedSampleDoc(doc);
     if (!safeDoc) return { ok: false, storedIn: 'browser', error: 'Invalid sanitised sample document.' };
@@ -489,7 +497,9 @@ export async function saveSanitisedSample(
     const next = { ...current.documents, [safeDoc.key]: safeDoc };
     const delta = diffSanitisedOverlay(current.bundled, next);
     const result = await saveSanitisedOverlay(delta);
-    return { ok: true, storedIn: result.storedIn };
+    return result.storedIn === 'browser'
+      ? { ok: true, storedIn: 'browser', warning: SANITISED_BROWSER_ONLY_WARNING }
+      : { ok: true, storedIn: result.storedIn };
   }
   const response = await proxyFetch('/api/pack-generator/sanitised-samples/save', {
     method: 'POST',
@@ -504,13 +514,15 @@ export async function saveSanitisedSample(
 
 export async function deleteSanitisedSample(
   key: string,
-): Promise<{ ok: boolean; storedIn: 'config' | 'app-kv' | 'browser'; error?: string }> {
+): Promise<{ ok: boolean; storedIn: 'config' | 'app-kv' | 'browser'; error?: string; warning?: string }> {
   if (getRunMode() === 'iframe') {
     const current = await iframeSanitisedStore();
     const next = { ...current.documents };
     delete next[key];
     const result = await saveSanitisedOverlay(diffSanitisedOverlay(current.bundled, next));
-    return { ok: true, storedIn: result.storedIn };
+    return result.storedIn === 'browser'
+      ? { ok: true, storedIn: 'browser', warning: 'App storage did not accept the removal, so it holds only in this browser tab — the sample comes back on reload.' }
+      : { ok: true, storedIn: result.storedIn };
   }
   const response = await proxyFetch('/api/pack-generator/sanitised-samples/delete', {
     method: 'POST',

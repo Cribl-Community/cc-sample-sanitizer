@@ -42,6 +42,7 @@ import sanitiseHintsData from '../config/sanitise-hints.json';
 // Pure classification/compilation of the secret rules. The rules themselves are NOT imported
 // here — they are installed from the bundled library and handed to `setSecretRules` (below).
 import { compileSecretRules, type SecretRule } from './secret-rule-filter';
+import { findCardNumbers, findIbans, findPhoneNumbers } from './sanitise-checksums';
 
 const SCHEMA_FIELD_NAMES: string[] = (sanitiseVocabulary as { schemaFieldNames?: string[] }).schemaFieldNames || [];
 const PUBLIC_CORPUS_TOKENS: string[] = (sanitiseVocabulary as { publicTokens?: string[] }).publicTokens || [];
@@ -429,14 +430,43 @@ export function fieldIdentityKind(rawName: string): IdentityKind | null {
 
 const EMAIL_RE = /\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g;
 const MAC_RE = /\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b/gi;
-const WINUSER_RE = /\b([A-Za-z][\w-]{1,30})\\([\w.$-]{1,64})\b/g;
+/* Anchored so a filesystem path is not read as DOMAIN\user: `C:\Windows\system32` would
+   otherwise yield host `Windows` and user `system32`. The domain must not follow a path
+   separator or drive colon, and the account must not be followed by a further separator. */
+const WINUSER_RE = /(?<![\\/:])\b([A-Za-z][\w-]{1,30})\\([\w.$-]{1,64})\b(?![\w.$-]*[\\/])/g;
 /* In JSON a real `DOMAIN\user` is written with a DOUBLED backslash (`DOMAIN\\user`); a
    single backslash is always a string escape. Matching the single-backslash form on a
    JSON line reads escape sequences as domain\user — `"AW:  Müller\t04.08.2026"`
    yields the bogus pair `u00fcller` \ `t04.08.2026` and, worse, rewriting a token next to
    a `\` produces an invalid escape (`\c`) that breaks the JSON. So JSON lines require the
    doubled backslash. */
-const WINUSER_JSON_RE = /\b([A-Za-z][\w-]{1,30})\\\\([\w.$-]{1,64})\b/g;
+const WINUSER_JSON_RE = /(?<![\\/:])\b([A-Za-z][\w-]{1,30})\\\\([\w.$-]{1,64})\b(?![\w.$-]*(?:\\\\|\/))/g;
+
+/**
+ * Usernames that free-text login messages put in a fixed phrase rather than a field.
+ *
+ * `Accepted publickey for jdoe from 10.1.2.3` has no `user=` for the field pass to read and
+ * no parser names it, yet it is the single most common identity in an auth log. The phrases
+ * are the programs' own fixed wording (sshd, pam_unix, sudo, the Windows text rendering), so
+ * each is anchored on words either side of the name — a bare `for X from` would also take
+ * `waiting for connection from`.
+ */
+const LOGIN_USER_NAME = '([A-Za-z_][\\w.$-]{0,63})';
+const LOGIN_USER_PHRASES: RegExp[] = [
+  // sshd: Accepted publickey for jdoe from / Failed password for invalid user bob from
+  new RegExp(`\\b(?:Accepted|Failed|Postponed) [\\w/-]+ for (?:invalid user |illegal user )?${LOGIN_USER_NAME} from\\b`, 'g'),
+  // sshd: Invalid user bob from / Connection closed by authenticating user bob 10.0.0.1
+  new RegExp(`\\b(?:[Ii]nvalid|[Ii]llegal|authenticating) user ${LOGIN_USER_NAME}(?= )`, 'g'),
+  // pam_unix: session opened for user jdoe(uid=1000) / Cisco: permitted udp for user jdoe outside/…
+  new RegExp(`\\bfor user ${LOGIN_USER_NAME}(?=[\\s(]|$)`, 'g'),
+  // sshd: Disconnected from user jdoe 10.0.0.1 port 22 — the address is what tells it from
+  // prose ("extracts words from user agents")
+  new RegExp(`\\bfrom user ${LOGIN_USER_NAME}(?= [\\d[]| [0-9a-f]*:)`, 'g'),
+  // sudo:   jdoe : TTY=pts/0 ; PWD=/home/jdoe ; USER=root ; COMMAND=/bin/ls
+  new RegExp(`\\bsudo(?:\\[\\d+\\])?:\\s+${LOGIN_USER_NAME} : `, 'g'),
+  // Windows Security events rendered as text: "Account Name:\t\tjdoe"
+  new RegExp(`\\bAccount Name:\\s+${LOGIN_USER_NAME}(?=\\s|$)`, 'g'),
+];
 
 /* A line is JSON only if it opens like one AND actually parses — a syslog line that merely
    contains a `{...}` blob is not, so it keeps the single-backslash (native) domain\user form. */
@@ -1014,7 +1044,7 @@ export function findSecrets(text: string): SecretHit[] {
 
     /* Named-field pass: a value in `password=` or `aws_secret_access_key=` is a credential
        regardless of shape, and no pattern safe enough to import could have found it. */
-    for (const { name, value } of fieldPairs(line)) {
+    for (const { name, value } of fieldPairs(line, true)) {
       if (!SECRET_FIELDS.has(canonField(name))) continue;
       const raw = value.trim().replace(/^["']|["']$/g, '');
       const scheme = raw.match(AUTH_SCHEME);
@@ -1045,13 +1075,20 @@ export function findSecrets(text: string): SecretHit[] {
  * seen. Colon-delimited values that matter (`outside:10.20.30.40`) are addresses, and
  * those are found by pattern anyway.
  */
-function* fieldPairs(line: string): Generator<{ name: string; value: string; index: number }> {
-  const kv = /(?:"([\w.$-]+)"\s*:|\b([\w.$-]+)\s*=)\s*(?:"([^"]*)"|'([^']*)'|([^\s,;"'}\]]+))/g;
+function* fieldPairs(line: string, keepSymbolic = false): Generator<{ name: string; value: string; index: number }> {
+  /* The bare-value branch excludes `{` and `[` as well as their closers: for
+     `"user":{"account":…}` it otherwise reads the `{` that opens the nested object as the
+     value, and masking that rewrites every brace in the sample. */
+  const kv = /(?:"([\w.$-]+)"\s*:|\b([\w.$-]+)\s*=)\s*(?:"([^"]*)"|'([^']*)'|([^\s,;"'{}[\]]+))/g;
   let m: RegExpExecArray | null;
   while ((m = kv.exec(line))) {
     const name = m[1] ?? m[2] ?? '';
     const value = m[3] ?? m[4] ?? m[5] ?? '';
     if (!name || !value) continue;
+    /* Pure punctuation (`-`, `:`, `{`) is never an identity, and replacing it everywhere
+       rewrites syntax. The secret pass alone keeps a QUOTED one: `"password":"!@#$%^&*"` is
+       still a credential, and it is long enough not to collide with structure. */
+    if (!/[\p{L}\p{N}]/u.test(value) && !(keepSymbolic && m[5] === undefined)) continue;
     yield { name, value, index: m.index + m[0].lastIndexOf(value) };
   }
 }
@@ -1114,14 +1151,26 @@ const SYSLOG_HEADER = new RegExp(
   + '\\s+([A-Za-z][\\w.-]{1,62})\\s+\\S',
 );
 
+/* The Common Log Format prefix — `host ident authuser [26/Nov/2019:01:34:17 +0000]` —
+   that Apache, nginx and most proxies share. Read by position, independent of the request
+   part: the Apache parser wants `"GET /x HTTP/1.1"` and reads nothing from a line whose
+   request has no protocol, which left every username on it to the unticked guesses. */
+const CLF_PREFIX = /^\s*(\S+)\s+(\S+)\s+(\S+)\s+\[\d{1,2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2}(?:\s+[+-]\d{4})?\]/;
+
 /** The `#Fields:` directive of a W3C extended log, which names every column. */
 const W3C_FIELDS = /^#Fields:\s*(.+)$/i;
+
+/* An XML element holding text and no child elements: `<Computer>ws-01</Computer>`, and the
+   Windows form that puts the field name in an attribute, `<Data Name="TargetUserName">jdoe
+   </Data>`. The tag (or the Name) is the field name, exactly as a parser would report it. */
+const XML_LEAF = /<([A-Za-z][\w.:-]*)((?:\s+[\w.:-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*>([^<>]{1,120})<\/\1\s*>/g;
+const XML_NAME_ATTR = /\bName\s*=\s*(?:"([^"]+)"|'([^']+)')/;
 
 /**
  * Field maps the FORMAT hands over, for samples no parser matched.
  *
- * Three structures carry their own column names and cost nothing to read: the syslog
- * header, a CSV/TSV header row, and a W3C `#Fields:` directive. Between them they cover a
+ * These structures carry their own column names and cost nothing to read: the syslog
+ * header, the CLF prefix, a CSV/TSV header row, and a W3C `#Fields:` directive. Between them they cover a
  * large share of what people actually upload, and unlike the shape heuristics these are
  * positional facts — a value in the syslog host slot IS the host, so it is offered ticked
  * rather than as a maybe.
@@ -1136,6 +1185,17 @@ export function structuralFields(lines: string[]): ParsedLine[] {
   lines.forEach((line, i) => {
     const m = SYSLOG_HEADER.exec(line);
     if (m?.[1]) put(i, 'host', m[1]);
+    const clf = CLF_PREFIX.exec(line);
+    if (clf) {
+      if (clf[2] !== '-') put(i, 'ident', clf[2]);
+      if (clf[3] !== '-') put(i, 'user', clf[3]);
+    }
+    if (!line.includes('</')) return;
+    for (const x of line.matchAll(XML_LEAF)) {
+      const named = XML_NAME_ATTR.exec(x[2]);
+      const name = named ? (named[1] ?? named[2]) : x[1].replace(/^[\w.-]+:/, '');   // drop a namespace prefix
+      put(i, name, x[3].trim());
+    }
   });
 
   // Column names, from a W3C directive or a plain header row.
@@ -1451,6 +1511,12 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
       if (!isNever(m[2])) patternAdd(m[2], 'user', 'DOMAIN\\user pattern');
     }
 
+    for (const re of LOGIN_USER_PHRASES) {
+      for (const m of line.matchAll(re)) {
+        if (!isNever(m[1]) && !m[1].endsWith('.')) patternAdd(m[1], 'user', 'login message wording');
+      }
+    }
+
     for (const m of line.matchAll(FQDN_RE)) {
       if (isNever(m[0]) || RESERVED_DOMAIN.test(m[0])) continue;
       patternAdd(m[0], 'fqdn', 'FQDN pattern');
@@ -1544,6 +1610,20 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
     if (found.size > before) tally.secret++;
   }
 
+  /* Values that prove themselves by checksum — see sanitise-checksums.ts. After the rules
+     library, so a card the library found beside the word "card" keeps that explanation. A
+     card is payment data and treated as a secret; an IBAN or a phone number points at a
+     person, so it is minted like one (no two collide). A value in a business-identifier
+     field (`order_id`, `invoice_id`) is left to that field's warning: a card-shaped order
+     number is still an order number, and the reviewer is already told to decide about it. */
+  const businessIdValues = new Set(Object.values(businessIdFields).flatMap(s => [...s]));
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    for (const v of findCardNumbers(line)) if (!found.has(v) && !businessIdValues.has(v)) { add(v, 'secret', 'card number (issuer prefix + Luhn check)'); tally.secret++; }
+    for (const v of findIbans(line)) if (!found.has(v)) { add(v, 'pii', 'IBAN (country length + mod-97 check)'); tally.pattern++; }
+    for (const v of findPhoneNumbers(line)) if (!found.has(v)) { add(v, 'pii', 'international phone number'); tally.pattern++; }
+  }
+
   if (opts.suggestSuspects !== false) {
     for (const s of findSuspects(lines, found, isNever)) {
       const before = found.size;
@@ -1573,7 +1653,11 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
      `4212` inside `name[4212]:` from also rewriting ports and counters on the same line. */
   for (const pat of opts.extraPatterns || []) {
     let re: RegExp;
-    try { re = new RegExp(pat.source, 'g'); }
+    // `d` (hasIndices) gives each named group its exact offset in the match. Without it the
+    // group is located by `indexOf` on its value, which lands on the wrong run when the same
+    // text also sits in the context before it — `1.2.3.4 - 4 [` with group `4` would mask the
+    // IP's last octet. A context-shape part mask (`\d+\.\d+… - (?<g1>…)`) makes that common.
+    try { re = new RegExp(pat.source, 'gd'); }
     catch {
       warnings.push(`Pattern “${pat.source}” is not a valid regular expression.`);
       continue;
@@ -1606,8 +1690,10 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
         .filter(n => selected.has(n) && groups[n] != null)
         .map(n => {
           const val = groups[n]!;
-          const idx = full.indexOf(val);
-          return { name: n, val, idx: idx < 0 ? 0 : idx };
+          const span = hit.indices?.groups?.[n];
+          const exact = span ? span[0] - hit.index : undefined;
+          const idx = exact ?? full.indexOf(val);
+          return { name: n, val, idx: idx < 0 ? 0 : idx, exact };
         })
         .sort((a, b) => a.idx - b.idx || a.name.localeCompare(b.name));
       // Prefer positions from the regex indices when available (named groups don't expose index in JS).
@@ -1617,7 +1703,7 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
       const patches: { start: number; end: number; alias: string }[] = [];
       const used = new Set<number>();
       for (const g of named) {
-        let at = full.indexOf(g.val, cursor);
+        let at = g.exact !== undefined && g.exact >= cursor ? g.exact : full.indexOf(g.val, cursor);
         // If the same digits appear twice, take the next occurrence not yet used.
         while (at >= 0 && used.has(at)) at = full.indexOf(g.val, at + 1);
         if (at < 0) continue;
@@ -1726,9 +1812,17 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
   const all = buildReplacer(candidates);
   const enabledOnly = buildReplacer(candidates.filter(e => e.enabled));
   if (all) {
-    text.replace(all.re, hit => {
+    text.replace(all.re, (hit: string, offset: number) => {
       hits.set(hit, (hits.get(hit) ?? 0) + 1);
       const e = all.byValue.get(hit)!;
+      /* A pick consumes its whole match, but apply still masks the auto-detected values in its
+         context (expandHit) — count those too, or the IP inside `<ip> - (?<user>…) [` scores
+         zero here and its row is dropped, leaving the IP in the clear on every picked line. */
+      if (e.via === PICKED_PATTERN_VIA) {
+        for (const piece of expandHit(text, offset, hit, e, all).pieces) {
+          if (piece.entry !== e) hits.set(piece.entry.original, (hits.get(piece.entry.original) ?? 0) + 1);
+        }
+      }
       if (e.enabled) return e.alias;
       /* Only a row that will actually be applied gets to consume the text. An unticked
          suspect that swallowed its matches here would hide them from the rows below it and
@@ -1882,7 +1976,100 @@ function buildReplacer(entries: SanitiseEntry[]) {
     branches.push(`(?<![\\w.$-])(?:${guarded.map(e => escapeRe(e.original)).join('|')})(?![\\w.$-])`);
   }
   const re = new RegExp(branches.length > 1 ? `(?:${branches.join('|')})` : branches[0], 'g');
-  return { re, byValue };
+  /* The auto-detected entries on their own, for the text AROUND a pick's groups. A pick wins
+     the alternation over anything nested in it, so without this second pass the IP in a
+     `<ip> - (?<user>…) [<date>]` pick would be written back verbatim — masked on the lines the
+     pick does not touch and leaked on every line it does. */
+  const inner = all.length > guarded.length && guarded.length
+    ? new RegExp(`(?<![\\w.$-])(?:${guarded.map(e => escapeRe(e.original)).join('|')})(?![\\w.$-])`, 'g')
+    : null;
+  return { re, inner, byValue };
+}
+
+type Replacer = NonNullable<ReturnType<typeof buildReplacer>>;
+
+/** One changed run inside a replacer hit, relative to the hit (before) and its alias (after). */
+interface HitPiece { bStart: number; bEnd: number; aStart: number; aEnd: number; entry: SanitiseEntry }
+
+/**
+ * A pick's alias split back into the stand-in for each patch span, using the known context
+ * between them (the alias is the original with only the patches swapped — `rebuildPatternAlias`).
+ * Null when the alias no longer has that layout (a hand edit reshaped it); the caller then uses
+ * the alias as one opaque swap, as before.
+ */
+function pickAliasParts(entry: SanitiseEntry): string[] | null {
+  const patches = entry.patchSpans!;
+  const o = entry.original, a = entry.alias;
+  const ctx = patches.map((p, i) => o.slice(i ? patches[i - 1].end : 0, p.start));
+  ctx.push(o.slice(patches[patches.length - 1].end));
+  if (!a.startsWith(ctx[0])) return null;
+  let pos = ctx[0].length;
+  const parts: string[] = [];
+  for (let i = 0; i < patches.length; i++) {
+    const next = ctx[i + 1];
+    let part: string;
+    if (i === patches.length - 1) {
+      if (!a.endsWith(next) || a.length - next.length < pos) return null;
+      part = a.slice(pos, a.length - next.length);
+    } else if (a.startsWith(patches[i].alias + next, pos)) {
+      part = patches[i].alias;
+    } else {
+      const at = a.indexOf(next, pos);
+      if (at < 0) return null;
+      part = a.slice(pos, at);
+    }
+    parts.push(part);
+    pos += part.length + next.length;
+  }
+  return pos === a.length ? parts : null;
+}
+
+/**
+ * What one replacer hit at `index` in `text` becomes, and which runs changed. A literal entry is
+ * one whole swap. A pick swaps its patch spans AND runs the auto-detected entries over the
+ * context between them (`inner`), so an IP or host inside the pick's anchor is still masked.
+ */
+function expandHit(text: string, index: number, matched: string, entry: SanitiseEntry, m: Replacer): { alias: string; pieces: HitPiece[] } {
+  const patches = entry.patchSpans;
+  if (!patches?.length) {
+    return { alias: entry.alias, pieces: [{ bStart: 0, bEnd: matched.length, aStart: 0, aEnd: entry.alias.length, entry }] };
+  }
+  const parts = m.inner ? pickAliasParts(entry) : null;
+  if (!parts) {
+    let delta = 0;
+    const pieces = patches.map(p => {
+      const aStart = p.start + delta;
+      delta += p.alias.length - (p.end - p.start);
+      return { bStart: p.start, bEnd: p.end, aStart, aEnd: aStart + p.alias.length, entry };
+    });
+    return { alias: entry.alias, pieces };
+  }
+  let out = '';
+  let cursor = 0;
+  const pieces: HitPiece[] = [];
+  const context = (end: number) => {
+    const inner = m.inner!;
+    inner.lastIndex = index + cursor;
+    for (let h = inner.exec(text); h && h.index < index + end; h = inner.exec(text)) {
+      const rs = h.index - index, re = rs + h[0].length;
+      if (re > end) break;
+      const e = m.byValue.get(h[0])!;
+      out += matched.slice(cursor, rs);
+      pieces.push({ bStart: rs, bEnd: re, aStart: out.length, aEnd: out.length + e.alias.length, entry: e });
+      out += e.alias;
+      cursor = re;
+    }
+    out += matched.slice(cursor, end);
+    cursor = end;
+  };
+  patches.forEach((p, i) => {
+    context(p.start);
+    pieces.push({ bStart: p.start, bEnd: p.end, aStart: out.length, aEnd: out.length + parts[i].length, entry });
+    out += parts[i];
+    cursor = p.end;
+  });
+  context(matched.length);
+  return { alias: out, pieces };
 }
 
 /** Where one entry sits in the text, for showing the reviewer what is covered. */
@@ -1916,13 +2103,8 @@ export function markSanitisation(text: string, entries: SanitiseEntry[]): Saniti
   m.re.lastIndex = 0;
   for (let hit = m.re.exec(text); hit; hit = m.re.exec(text)) {
     const entry = m.byValue.get(hit[0])!;
-    const patches = entry.patchSpans;
-    if (patches?.length) {
-      for (const p of patches) {
-        spans.push({ start: hit.index + p.start, end: hit.index + p.end, entry });
-      }
-    } else {
-      spans.push({ start: hit.index, end: hit.index + hit[0].length, entry });
+    for (const p of expandHit(text, hit.index, hit[0], entry, m).pieces) {
+      spans.push({ start: hit.index + p.bStart, end: hit.index + p.bEnd, entry: p.entry });
     }
   }
   return spans.sort((a, b) => a.start - b.start || a.end - b.end);
@@ -1936,9 +2118,12 @@ export function markSanitisation(text: string, entries: SanitiseEntry[]): Saniti
  */
 export function patternPatchDisplay(entry: SanitiseEntry): { from: string; to: string } | null {
   if (!entry.patchSpans?.length) return null;
+  /* `to` is read back out of the ALIAS, not the minted `patchSpans[].alias`: the alias is what
+     a reviewer's edit changes (rebuildPatternAlias) and what survives a re-plan, so showing the
+     minted stand-in would snap the input back to it on every keystroke. */
   return {
     from: entry.patchSpans.map(p => entry.original.slice(p.start, p.end)).join('+'),
-    to: entry.patchSpans.map(p => p.alias).join('+'),
+    to: (pickAliasParts(entry) ?? entry.patchSpans.map(p => p.alias)).join('+'),
   };
 }
 
@@ -1970,7 +2155,7 @@ export function applySanitisation(text: string, entries: SanitiseEntry[]): strin
   if (!m) return text;
   /* A function replacer, so an alias is inserted literally. A machine-account alias ends in
      `$`, and `$&` in a string replacement would splice the match back in. */
-  return text.replace(m.re, hit => m.byValue.get(hit)!.alias);
+  return text.replace(m.re, (hit: string, offset: number) => expandHit(text, offset, hit, m.byValue.get(hit)!, m).alias);
 }
 
 export interface PreviewLine {
@@ -2053,29 +2238,19 @@ export function previewSanitisation(
     for (let hit = m.re.exec(before); hit; hit = m.re.exec(before)) {
       const matched = hit[0];
       const entry = m.byValue.get(matched)!;
-      const alias = entry.alias;
-      const entryKey = `${entry.kind}:${entry.original}`;
-      const isTry = tryKeys ? tryKeys.has(entryKey) : false;
-      const isBad = badKeys ? badKeys.has(entryKey) : false;
       after += before.slice(at, hit.index);
       const aStart = after.length;
-      if (entry.patchSpans?.length) {
-        /* A pattern pick keeps its punctuation and only swaps the captured sub-runs, so mark
-           exactly those — never a character diff of matched vs alias, which over-trims the
-           moment a stand-in digit/letter coincides with the original (`8196` → `…6` marked
-           only `819`). The before-spans index into the token; the after-spans track the
-           running length delta as each run is replaced left-to-right. */
-        let delta = 0;
-        for (const p of entry.patchSpans) {
-          beforeSpans.push({ start: hit.index + p.start, end: hit.index + p.end, try: isTry, bad: isBad });
-          const aRunStart = aStart + p.start + delta;
-          afterSpans.push({ start: aRunStart, end: aRunStart + p.alias.length, try: isTry, bad: isBad });
-          delta += p.alias.length - (p.end - p.start);
-        }
-      } else {
-        // A literal identity swap: the whole matched value IS the identity — mark it whole.
-        beforeSpans.push({ start: hit.index, end: hit.index + matched.length, try: isTry, bad: isBad });
-        afterSpans.push({ start: aStart, end: aStart + alias.length, try: isTry, bad: isBad });
+      /* A pattern pick keeps its punctuation and only swaps the captured sub-runs (plus any
+         auto-detected value in its context), so mark exactly those pieces — never a character
+         diff of matched vs alias, which over-trims the moment a stand-in digit/letter coincides
+         with the original (`8196` → `…6` marked only `819`). A literal swap is one whole piece. */
+      const { alias, pieces } = expandHit(before, hit.index, matched, entry, m);
+      for (const p of pieces) {
+        const entryKey = `${p.entry.kind}:${p.entry.original}`;
+        const isTry = tryKeys ? tryKeys.has(entryKey) : false;
+        const isBad = badKeys ? badKeys.has(entryKey) : false;
+        beforeSpans.push({ start: hit.index + p.bStart, end: hit.index + p.bEnd, try: isTry, bad: isBad });
+        afterSpans.push({ start: aStart + p.aStart, end: aStart + p.aEnd, try: isTry, bad: isBad });
       }
       after += alias;
       at = hit.index + matched.length;
@@ -2233,9 +2408,12 @@ export function checkStructurePreserved(before: string, after: string): Structur
 /** The delimiter + whitespace characters whose per-line count `checkStructurePreserved` guards. */
 const STRUCTURAL_CHARS = ['\t', '|', ',', '=', ' '];
 
+/** How many JSON lines the sanitisation breaks `structuralOffenders` attributes to entries. */
+const JSON_PROBE_LINES = 40;
+
 /**
- * Which enabled entries would shift a structural character count — i.e. exactly the masks the
- * save gate (`checkStructurePreserved`) would flag as changing the wire format.
+ * Which enabled entries would trip the save gate (`checkStructurePreserved`) — i.e. exactly
+ * the masks it would flag as changing the wire format.
  *
  * A replacement swaps `original`→`alias` in place, so it changes a line's count of a
  * delimiter/whitespace char if and only if the alias holds a different number of that char than
@@ -2243,16 +2421,64 @@ const STRUCTURAL_CHARS = ['\t', '|', ',', '=', ' '];
  * lets the UI attribute a whole-sample structural break back to the individual pick that caused
  * it and paint just those spans red, instead of only reporting a line count. Returns the
  * `${kind}:${original}` keys, the same convention `previewSanitisation`'s `badKeys` expects.
+ *
+ * The JSON half of the gate cannot be read off the entry alone: `{` → `uhayes` holds the same
+ * delimiters and whitespace, yet rewriting every brace leaves no line parseable. So when the
+ * sample `text` is passed, the lines that were valid JSON and stop parsing (or change their
+ * keys) under the whole plan are found, and each entry that hits such a line is tried on it
+ * ON ITS OWN; the ones that break it alone are flagged. Without this the banner reports broken
+ * JSON while nothing in the preview is marked. Only broken lines are probed, so a plan that
+ * keeps the JSON intact costs one replace-and-parse per line, however many entries it has.
  */
-export function structuralOffenders(entries: SanitiseEntry[]): Set<string> {
+export function structuralOffenders(entries: SanitiseEntry[], text?: string): Set<string> {
   const bad = new Set<string>();
-  for (const e of entries) {
-    if (!e.enabled || !e.alias || e.alias === e.original) continue;
-    for (const d of STRUCTURAL_CHARS) {
-      if (countOf(e.original, d) !== countOf(e.alias, d)) { bad.add(`${e.kind}:${e.original}`); break; }
-    }
+  const live = entries.filter(e => e.enabled && e.alias && e.alias !== e.original);
+  for (const e of live) {
+    if (STRUCTURAL_CHARS.some(d => countOf(e.original, d) !== countOf(e.alias, d))) bad.add(`${e.kind}:${e.original}`);
   }
+  if (text !== undefined) for (const key of jsonOffenders(live, text)) bad.add(key);
   return bad;
+}
+
+/** The entries that, applied alone, break a JSON line the whole plan breaks. */
+function jsonOffenders(live: SanitiseEntry[], text: string): Set<string> {
+  const out = new Set<string>();
+  const m = buildReplacer(live);
+  if (!m) return out;
+  let examined = 0;
+  for (const line of text.split('\n')) {
+    const t = line.trimStart();
+    if (!t.startsWith('{') && !t.startsWith('[')) continue;
+    const after = line.replace(m.re, hit => m.byValue.get(hit)!.alias);
+    if (after === line) continue;
+    // '' for a line that was not valid JSON to begin with — not ours to judge.
+    const keys = jsonKeys(line);
+    if (!keys || jsonKeys(after) === keys) continue;
+    for (const hit of new Set(line.match(m.re) || [])) {
+      const e = m.byValue.get(hit);
+      if (e && jsonKeys(applySanitisation(line, [e])) !== keys) out.add(`${e.kind}:${e.original}`);
+    }
+    if (++examined >= JSON_PROBE_LINES) break;
+  }
+  return out;
+}
+
+/**
+ * The save gate's verdict in plain words, for the banner that blocks Apply.
+ *
+ * Names what actually broke — `checkStructurePreserved`'s own problem lines — rather than a
+ * fixed sentence about delimiters: a sample whose JSON a replacement broke was told it had
+ * "shifted a delimiter or whitespace boundary", which sent the reviewer looking for the wrong
+ * thing. `marked` is how many entries `structuralOffenders` could attribute it to; when none
+ * could be (two picks that only break the line together), it says so instead of pointing at
+ * red marks that are not there.
+ */
+export function structureBannerText(problems: string[], marked: number): string {
+  const what = problems.length ? problems.join(' ') : 'The sanitised sample no longer has the same structure as the original.';
+  const fix = marked
+    ? `Untick or edit the ${marked === 1 ? 'replacement' : `${marked} replacements`} marked in red — this clears as soon as the structure is intact.`
+    : 'No single replacement causes it on its own — untick replacements one at a time until this clears.';
+  return `Sanitising would change the sample's structure: ${what} ${fix}`;
 }
 
 function countOf(s: string, ch: string): number {
@@ -2692,10 +2918,56 @@ function growAlnumRange(scope: string, relStart: number, relEnd: number): { star
  * survives, or when the single surviving run is the whole scope (that is the plain whole-value
  * pick, not a part). `ranges` index into `scope`.
  */
+export type PartMatchMode = 'shape' | 'any' | 'exact';
+export type PartContextMode = 'exact' | 'shape';
+
+/** Characters an `any`-mode part never runs across: whitespace, quotes, brackets and the usual
+ *  field separators. The comma is written `\x2c` because a pattern pick may be pasted into the
+ *  comma-separated extras box (splitExtras keeps `re:` lines whole, but a hand edit may not). */
+const ANY_PART_STOP = '\\s"\'\\[\\](){}<>\\x2c;=|';
+
+function escapeClassChar(ch: string): string {
+  return /[\\\]\[^-]/.test(ch) ? `\\${ch}` : ch;
+}
+
+/**
+ * `any` mode: a token class for values whose shape varies line to line — usernames like
+ * `marquardt4474`, `john.doe`, `svc_web`, `CORP\jsmith`, `bob@corp.com`. Runs to the next stop
+ * character (and the first character of the literal that follows, so `user:pass` stops at the
+ * `:`). It may not START with `-`, so the CLF "no user" dash is left alone.
+ */
+function anyPartClass(nextChar: string | undefined): string {
+  const extra = nextChar && !/[A-Za-z0-9\s]/.test(nextChar) && !'"\'[](){}<>,;=|'.includes(nextChar)
+    ? escapeClassChar(nextChar) : '';
+  return `[^${ANY_PART_STOP}${extra}-][^${ANY_PART_STOP}${extra}]*`;
+}
+
+/**
+ * The context between picked parts, generalised to its SHAPE: each alnum run becomes a
+ * non-capturing class (`67.207.231.248` → `\d+\.\d+\.\d+\.\d+`, `Nov` → `[A-Za-z]+`) and the
+ * punctuation and spaces stay literal. That keeps "an IP, then the user, then a timestamp"
+ * as the anchor without hardcoding THIS line's IP and date.
+ */
+function contextShapeSource(text: string): string {
+  let out = '';
+  const runs = [...text.matchAll(/[A-Za-z0-9]+|[^A-Za-z0-9]+/g)].map(m => m[0]);
+  runs.forEach((run, i) => {
+    if (/^[A-Za-z]+$/.test(run)) out += '[A-Za-z]+';
+    else if (/^\d+$/.test(run)) out += '\\d+';
+    else if (/^[A-Za-z0-9]+$/.test(run)) out += '[A-Za-z0-9]+';
+    // A sign straight before a number is part of the value's shape, not fixed text — a
+    // timezone `+0000` on one line is `-0500` on the next.
+    else if (/[+-]$/.test(run) && /^\d+$/.test(runs[i + 1] ?? '')) out += `${escapeRe(run.slice(0, -1))}[+-]`;
+    else out += escapeRe(run);
+  });
+  return out;
+}
+
 export function markedValueShapeMulti(
   scope: string,
   ranges: { start: number; end: number }[],
-  mode: 'shape' | 'exact' = 'shape',
+  mode: PartMatchMode = 'shape',
+  context: PartContextMode = 'exact',
 ): ShapePattern | null {
   if (!scope || !ranges.length) return null;
   const grown = ranges
@@ -2715,8 +2987,9 @@ export function markedValueShapeMulti(
   let source = '';
   let cursor = 0;
   let gi = 1;
+  const lit = context === 'shape' ? contextShapeSource : escapeRe;
   for (const run of merged) {
-    source += escapeRe(scope.slice(cursor, run.start));
+    source += lit(scope.slice(cursor, run.start));
     const marked = scope.slice(run.start, run.end);
     let kind: PatternGroup['kind'];
     if (/^[A-Za-z]+$/.test(marked)) kind = 'letters';
@@ -2726,15 +2999,24 @@ export function markedValueShapeMulti(
     // shape in this context is masked (the reviewer's "wildcards"); 'exact' → the run's own
     // literal so ONLY this value is masked here (their "exact match like 12345"). Both keep
     // the surrounding punctuation literal, which is what pins the match to this one place.
+    // 'any' → a token class that also takes `.`, `_`, `@`, `\` (see anyPartClass), for a value
+    // whose shape varies from line to line, like a username.
     const cls = mode === 'exact'
       ? escapeRe(marked)
+      : mode === 'any' ? anyPartClass(scope[run.end])
       : kind === 'letters' ? '[A-Za-z]+' : kind === 'digits' ? '\\d+' : '[A-Za-z0-9]+';
     const name = `g${gi++}`;
     source += `(?<${name}>${cls})`;
     groups.push({ name, sample: marked, kind, classRe: cls });
     cursor = run.end;
   }
-  source += escapeRe(scope.slice(cursor));
+  source += lit(scope.slice(cursor));
+  if (context === 'shape') {
+    // A generalised edge must not start or end inside a longer run: `\d+\.` would otherwise
+    // match the tail of `x12.` and `\d+$` the head of `2019abc`.
+    if (/^[A-Za-z0-9]/.test(scope)) source = `(?<![A-Za-z0-9])${source}`;
+    if (/[A-Za-z0-9]$/.test(scope)) source += '(?![A-Za-z0-9])';
+  }
   return { source, groups, token: scope };
 }
 
@@ -3442,14 +3724,30 @@ export function aiSampleSnippet(opts: {
   required: boolean;
   lines?: number;
 }): string {
-  const { sampleEvents, sourceMode, sanitised, required, lines = 15 } = opts;
+  const refusal = aiSampleRefusal(opts);
+  if (refusal) throw new UnsanitisedSampleError(refusal);
+  return opts.sampleEvents.split('\n').slice(0, opts.lines ?? 15).join('\n');
+}
+
+/**
+ * The same decision as `aiSampleSnippet`, as a value: the refusal message, or null
+ * when these events may reach the AI provider. For a caller that must decide up front
+ * whether to run its AI steps at all (the staged builder), rather than fail at the
+ * first one.
+ */
+export function aiSampleRefusal(opts: {
+  sampleEvents: string;
+  sourceMode: string;
+  sanitised: boolean | undefined;
+  required: boolean;
+}): string | null {
+  const { sampleEvents, sourceMode, sanitised, required } = opts;
   if (required && sampleNeedsSanitising(sourceMode) && sampleEvents.trim() && !sanitised) {
-    throw new UnsanitisedSampleError(
-      'These events have not been sanitised, and sending un-sanitised sample data to the AI provider is turned off. '
+    return 'These events have not been sanitised, and sending un-sanitised sample data to the AI provider is turned off. '
       + 'Use “Sanitize sample” on the source step to replace hostnames, usernames and IP addresses locally, '
-      + 'then run this again. (Settings → “Require sanitised samples” controls this.)');
+      + 'then run this again. (Samples → Sharing → “Require sanitised samples before any AI call” controls this.)';
   }
-  return sampleEvents.split('\n').slice(0, lines).join('\n');
+  return null;
 }
 
 // ---------------------------------------------------------------------------

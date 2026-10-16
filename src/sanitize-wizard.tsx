@@ -3,6 +3,8 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   downloadSample,
   downloadPackSample,
+  fetchSanitisedSample,
+  fetchSanitisedSamples,
   listGroups,
   listGroupAndPackSamples,
   liveCapture,
@@ -15,6 +17,7 @@ import {
   downloadSanitisedSamplePayload,
   sanitisedSampleKey,
   type SanitisedSampleDoc,
+  type SanitisedSampleIndexRow,
 } from './sanitised-sample-store';
 import {
   applyAndVerifySanitisation,
@@ -28,7 +31,7 @@ import {
   type LocalSampleRecognition,
 } from './sanitised-sample-workflow';
 import { canonicalizeSourcetype, getSupportedSourcetypeCatalog } from './source-recognition';
-import { buildSanitiseChoices, canRefineSelection, countShapeMatches, describeRegexDraft, describeSelection, encodePatternExtra, markedValueShapeMulti, patternPatchDisplay, PICKED_PATTERN_VIA, previewSanitisation, regexFromSelection, splitExtras, splitStructuredToken, structuralOffenders, type SanitiseEntry, type SanitisePlan, type SelectionCandidate } from './sample-sanitise';
+import { buildSanitiseChoices, canRefineSelection, countShapeMatches, describeRegexDraft, describeSelection, encodePatternExtra, markedValueShapeMulti, patternPatchDisplay, PICKED_PATTERN_VIA, rebuildPatternAlias, previewSanitisation, regexFromSelection, splitExtras, splitStructuredToken, structuralOffenders, structureBannerText, applySanitisation, checkStructurePreserved, type PartContextMode, type PartMatchMode, type SanitiseEntry, type SanitisePlan, type SelectionCandidate } from './sample-sanitise';
 import { ensureSecretRules, secretRulesNotice, secretRulesStatus, type SecretRulesStatus } from './secret-rules';
 import { groupEntries, SANITISE_ROW_CAP } from './sanitise-groups';
 
@@ -82,9 +85,42 @@ export interface SanitizeWizardProps {
   // cleanly against the source's declared wire format) so the pack generator can surface it
   // in a notice without stranding the user — apply mode is advisory, not the strict library gate.
   onApply?: (events: string[], sourcetype: string, warning?: string | null) => void;
+  // Pick mode: opened from one batch pre-flight row to choose that row's sample. Same
+  // steps as the library flow minus the save destinations: choose events (the library
+  // sample, a saved sanitised sample, or your own), confirm the sourcetype the sample names,
+  // sanitize your own data, then hand the result back via onPick. The library sample is
+  // PUSHED IN by the caller (`librarySample`) — this module must stay unable to reach the
+  // reference/bundled stores itself (the sanitizer build is AI- and bundle-free).
+  pickMode?: boolean;
+  pickTitle?: string;
+  librarySample?: () => Promise<LibrarySample | null>;
+  onPick?: (pick: SamplePick) => void;
+}
+
+export interface LibrarySample {
+  events: string[];
+  label: string;
+  sourcetype?: string;
+}
+
+export interface SamplePick {
+  events: string[];
+  sourcetype: string;
+  /**
+   * May these events reach the AI provider? True for a sanitised result, a saved
+   * (already sanitised) sample, and the library sample (public vendor data).
+   */
+  sanitised: boolean;
+  origin: 'library' | 'saved' | 'own';
+  label: string;
+  warning?: string | null;
+  /** What happened to the optional "also add to the sample library" save. */
+  libraryNote?: string;
 }
 
 type SourceMode = 'upload' | 'paste' | 'group' | 'live-capture';
+// Pick mode only: events that are not the user's own and need no sanitising.
+type PickSource = 'library' | 'saved';
 type Step = 'events' | 'source' | 'sanitize' | 'save';
 type Group = { id: string; name?: string; workerCount?: number };
 type GroupSample = { id: string; name: string; size?: number; numEvents?: number; packId?: string; packName?: string };
@@ -100,6 +136,13 @@ const STEPS: { id: Step; label: string }[] = [
 // events/source pickers and the library save destinations are all skipped — the reviewer
 // just reviews the replacements and applies them back into the pack.
 const APPLY_STEPS: { id: Step; label: string }[] = [
+  { id: 'sanitize', label: 'Sanitize' },
+];
+
+// Pick mode ends on Sanitize: the row takes the result, there is nothing else to save to.
+const PICK_STEPS: { id: Step; label: string }[] = [
+  { id: 'events', label: 'Sample' },
+  { id: 'source', label: 'Sourcetype' },
   { id: 'sanitize', label: 'Sanitize' },
 ];
 
@@ -131,10 +174,20 @@ export function SanitizeWizard({
   open, onClose, runMode, canPublish = false, repo = '',
   onLibraryChanged, embedded = false,
   applyMode = false, initialRaw = '', initialSourcetype = '', onApply,
+  pickMode = false, pickTitle = '', librarySample, onPick,
 }: SanitizeWizardProps) {
-  const steps = applyMode ? APPLY_STEPS : STEPS;
+  const steps = applyMode ? APPLY_STEPS : pickMode ? PICK_STEPS : STEPS;
   const [step, setStep] = useState<Step>('events');
   const [sourceMode, setSourceMode] = useState<SourceMode>('upload');
+  // Pick mode: the library/saved tiles. Null = one of the own-data modes in `sourceMode`.
+  const [pickSource, setPickSource] = useState<PickSource | null>(null);
+  const [libSample, setLibSample] = useState<LibrarySample | null>(null);
+  const [libLoading, setLibLoading] = useState(false);
+  const [saved, setSaved] = useState<SanitisedSampleIndexRow[]>([]);
+  const [savedDocs, setSavedDocs] = useState<Record<string, SanitisedSampleDoc>>({});
+  const [savedKey, setSavedKey] = useState('');
+  const [savedSearch, setSavedSearch] = useState('');
+  const [addToLibrary, setAddToLibrary] = useState(true);
   const [raw, setRaw] = useState('');
   const [sourceLabel, setSourceLabel] = useState('');
   const [groups, setGroups] = useState<Group[]>([]);
@@ -160,6 +213,11 @@ export function SanitizeWizard({
   const [groupSampleName, setGroupSampleName] = useState('');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
+  // Set while `error` is the structure gate's banner. The verdict is then re-derived on every
+  // toggle/alias edit (see the effect below), so unticking the offending entry clears the
+  // banner at once instead of leaving it up until the next Apply.
+  const [structureBlock, setStructureBlock] = useState(false);
+  const structureBannerRef = useRef('');
   // Identities the parser still saw unchanged after the last Apply attempt — the blocker that
   // stops the save. Kept as structured rows (not just a sentence) so the panel can point the
   // reviewer at the exact line + field and highlight it in the before pane.
@@ -204,9 +262,14 @@ export function SanitizeWizard({
   const [maskTarget, setMaskTarget] = useState<'whole' | 'part'>('whole');
   const [matchBy, setMatchBy] = useState<'format' | 'exact'>('format');
   //  - `partMatchBy` — once a PART is picked, mask it by its SHAPE (a class like `\d+`, catching
-  //    any value of that shape in this spot — "based on wildcards") or EXACTLY (only this literal
-  //    value, e.g. `12345`, in this spot). Drives the `markedValueShapeMulti` mode below.
-  const [partMatchBy, setPartMatchBy] = useState<'shape' | 'exact'>('shape');
+  //    any value of that shape in this spot — "based on wildcards"), as ANY token (also `.` `_`
+  //    `@` `\`, for usernames like `john.doe`), or EXACTLY (only this literal value, e.g. `12345`,
+  //    in this spot). Drives the `markedValueShapeMulti` mode below.
+  //  - `partContext` — whether the text AROUND the part must be this exact text (one place), or
+  //    only the same shape (`\d+\.\d+… - <user> \[\d+/[A-Za-z]+/…`), so "an IP, then the user,
+  //    then a timestamp" matches on every line without hardcoding this line's IP and date.
+  const [partMatchBy, setPartMatchBy] = useState<PartMatchMode>('shape');
+  const [partContext, setPartContext] = useState<PartContextMode>('exact');
   const [partRanges, setPartRanges] = useState<{ start: number; end: number }[]>([]);
   // The interactive value strip (the part picker). Selection offsets are read off it directly.
   const stripRef = useRef<HTMLDivElement>(null);
@@ -347,8 +410,49 @@ export function SanitizeWizard({
     setCaptureMaxEvents(100);
     setCaptureDuration(10);
     setCaptureLoading(false);
+    setPickSource(null);
+    setLibSample(null);
+    setSavedKey('');
+    setSavedSearch('');
+    setAddToLibrary(true);
     preApply.current = null;
   }, [open]);
+
+  // Pick mode: load what the row can use without bringing its own data — the library
+  // sample for the declared sourcetype (preselected when there is one) and the saved
+  // sanitised samples. Either failing just leaves that tile empty.
+  useEffect(() => {
+    if (!open || !pickMode) return;
+    let live = true;
+    setSourceMode('upload');
+    if (librarySample) {
+      setLibLoading(true);
+      void librarySample()
+        .then(found => {
+          if (!live) return;
+          const usable = found && found.events.some(line => line.trim()) ? found : null;
+          setLibSample(usable);
+          if (usable) setPickSource(current => current ?? 'library');
+        })
+        .catch(() => { if (live) setLibSample(null); })
+        .finally(() => { if (live) setLibLoading(false); });
+    }
+    void fetchSanitisedSamples()
+      .then(state => { if (live) { setSaved(state.samples); setSavedDocs(state.documents); } })
+      .catch(() => { if (live) setSaved([]); });
+    return () => { live = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps — load once per open
+  }, [open, pickMode]);
+
+  // Saved samples for the row's declared source first, then the rest; type to filter.
+  const savedList = useMemo(() => {
+    const want = canonicalizeSourcetype(initialSourcetype || '');
+    const q = savedSearch.trim().toLowerCase();
+    return saved
+      .filter(row => !q || row.key.toLowerCase().includes(q) || row.sourcetype.toLowerCase().includes(q))
+      .sort((a, b) => Number(canonicalizeSourcetype(b.sourcetype) === want) - Number(canonicalizeSourcetype(a.sourcetype) === want)
+        || a.key.localeCompare(b.key));
+  }, [saved, savedSearch, initialSourcetype]);
 
   const activeIndex = steps.findIndex(item => item.id === step);
   const enabled = plan?.entries.filter(item => item.enabled).length || 0;
@@ -423,12 +527,12 @@ export function SanitizeWizard({
   // masked together while their context stays. Null (nothing valid picked) means "no part yet".
   const partMask = useMemo(() => {
     if (!partRanges.length) return null;
-    const shape = markedValueShapeMulti(wholeValueText, partRanges, partMatchBy);
+    const shape = markedValueShapeMulti(wholeValueText, partRanges, partMatchBy, partContext);
     if (!shape) return null;
     const matches = countShapeMatches(raw, shape.source);
     if (!matches) return null;
     return { token: encodePatternExtra(shape.source, shape.groups.map(g => g.name)), shape, matches };
-  }, [partRanges, wholeValueText, raw, partMatchBy]);
+  }, [partRanges, wholeValueText, raw, partMatchBy, partContext]);
 
   // A new selection resets the two questions to their safe defaults: mask the WHOLE value, by its
   // FORMAT if that is offered (else the exact text), and no parts chosen yet.
@@ -436,6 +540,7 @@ export function SanitizeWizard({
     setMaskTarget('whole');
     setMatchBy(formatChoice ? 'format' : 'exact');
     setPartMatchBy('shape');
+    setPartContext('exact');
     setPartRanges([]);
     // formatChoice is derived from sel; keying on sel keeps this to one run per selection.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -535,9 +640,9 @@ export function SanitizeWizard({
   // survives an edit keeps the reviewer's decision, a newly-appeared group defaults to ON (you
   // named it to mask it), and a group that disappears drops out.
   const regexGroupNames = regexInfo?.valid ? regexInfo.groups.map(group => group.name) : [];
-  const regexNamesKey = regexGroupNames.join(' ');
+  const regexNamesKey = regexGroupNames.join('\u0000');
   useEffect(() => {
-    const names = regexNamesKey ? regexNamesKey.split(' ') : [];
+    const names = regexNamesKey ? regexNamesKey.split('\u0000') : [];
     const prev = regexNamesRef.current;
     if (names.length === prev.length && names.every((name, i) => name === prev[i])) return;
     regexNamesRef.current = names;
@@ -588,7 +693,7 @@ export function SanitizeWizard({
     // has any (regexProvisional), otherwise a clean before=after — never the ambient base
     // plan, whose auto-detected masks would read as the regex over-matching.
     const active = activeProvisional?.plan ?? (regexOpen ? { ...plan, entries: [] } : plan);
-    const badKeys = structuralOffenders(active.entries);
+    const badKeys = structuralOffenders(active.entries, raw);
     const built = previewSanitisation(raw, active.entries, PREVIEW_LINE_CAP, true, activeProvisional?.tryKeys, badKeys);
     return { ...built, badKeys };
   }, [plan, raw, activeProvisional, regexOpen]);
@@ -611,12 +716,28 @@ export function SanitizeWizard({
     setError('');
     setBusy('Inspecting locally…');
     try {
-      const text = sourceMode === 'group' ? await loadGroupSample() : normaliseSampleInput(raw);
+      let text: string;
+      let named = '';
+      if (pickSource === 'library') {
+        if (!libSample) throw new Error('There is no library sample for this sourcetype — choose another option.');
+        text = normaliseSampleInput(libSample.events.join('\n'));
+        named = libSample.sourcetype || '';
+        setSourceLabel(libSample.label);
+      } else if (pickSource === 'saved') {
+        if (!savedKey) throw new Error('Choose a saved sample.');
+        const doc = savedDocs[savedKey] || await fetchSanitisedSample(savedKey);
+        if (!doc?.events.length) throw new Error('That saved sample could not be read.');
+        text = normaliseSampleInput(doc.events.join('\n'));
+        named = doc.sourcetype;
+        setSourceLabel(`saved · ${doc.key}`);
+      } else {
+        text = sourceMode === 'group' ? await loadGroupSample() : normaliseSampleInput(raw);
+      }
       if (!text.trim()) throw new Error(sourceMode === 'upload' ? 'Choose a file first.' : 'Add at least one event.');
       setRaw(text);
       const found = recogniseSampleLocally(text);
       setRecognition(found);
-      setSourcetype(found.sourcetype);
+      setSourcetype(named || found.sourcetype);
       setStep('source');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -871,6 +992,33 @@ export function SanitizeWizard({
     }
   }
 
+  // The structure gate's banner: what broke, in plain words, and how many entries are marked.
+  function blockOnStructure(problems: string[]) {
+    showStructureBanner(structureBannerText(problems, structuralOffenders(plan?.entries || [], raw).size));
+    setStructureBlock(true);
+    requestAnimationFrame(() => alertRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
+  }
+
+  function showStructureBanner(text: string) {
+    structureBannerRef.current = text;
+    setError(text);
+  }
+
+  // Live re-check while the structure banner is up: toggling, grouping or re-aliasing an entry
+  // changes the plan, so the verdict is recomputed and the banner updated or cleared.
+  useEffect(() => {
+    if (!structureBlock) return;
+    const entries = plan?.entries || [];
+    const check = checkStructurePreserved(raw, applySanitisation(raw, entries));
+    if (check.ok) { setStructureBlock(false); setError(''); return; }
+    showStructureBanner(structureBannerText(check.problems, structuralOffenders(entries, raw).size));
+  }, [plan, raw, structureBlock]);
+
+  // Any other message replacing the banner ends the live re-check, so it cannot overwrite it.
+  useEffect(() => {
+    if (structureBlock && error !== structureBannerRef.current) setStructureBlock(false);
+  }, [error, structureBlock]);
+
   function toggleEntry(original: string, kind: string) {
     setPlan(current => current
       ? { ...current, entries: current.entries.map(item =>
@@ -894,6 +1042,88 @@ export function SanitizeWizard({
       : current);
   }
 
+  // Pick mode, no sanitising: the library/saved sample as it is, or the user's own events
+  // when they chose to skip the review (then `sanitised` is false and the AI gate decides).
+  function pickAsIs() {
+    setError('');
+    const st = sourcetype.trim();
+    if (!st) { setError('Enter or confirm a sourcetype.'); return; }
+    const events = raw.split('\n').filter(line => line.trim());
+    onPick?.({
+      events,
+      sourcetype: st,
+      sanitised: pickSource !== null,
+      origin: pickSource ?? 'own',
+      label: sourceLabel || `${sourceMode} sample`,
+    });
+    onClose();
+  }
+
+  // Pick mode, sanitised: the same advisory run as apply mode, except a sample with nothing
+  // to replace is accepted (it was reviewed). A broken structure still blocks. The library
+  // save is optional and strict — its failure is reported, it never blocks the row.
+  async function pickSanitised() {
+    setError('');
+    setSurvivors([]);
+    const entries = plan?.entries || [];
+    const run = runSanitisation(raw, sourcetype, entries, { verify: true });
+    if (!run.structure.ok) {
+      blockOnStructure(run.structure.problems);
+      return;
+    }
+    const degraded = run.verification?.verdict === 'fail' && run.verificationBefore?.verdict !== 'fail';
+    const warning = degraded
+      ? `Sanitising changed the events enough that the ${sourcetype} parser no longer reads them cleanly: ${run.verification!.reasons.join(' ')}`
+      : null;
+    let libraryNote: string | undefined;
+    if (addToLibrary && !embedded) {
+      setBusy('Saving to the library…');
+      try {
+        const verified = applyAndVerifySanitisation(raw, sourcetype, entries);
+        const doc = buildSanitisedSampleDoc({
+          sourcetype,
+          format: recognition?.format.id,
+          events: verified.events,
+          verification: verified.verification,
+          provenance: {
+            sourceMode,
+            sourceLabel: sourceLabel || `${sourceMode} sample`,
+            replacementsApplied: verified.replacementsApplied,
+            structurePreserved: verified.structure.ok,
+            coverage: {
+              total: verified.coverage.total,
+              replaced: verified.coverage.replaced,
+              ok: verified.coverage.ok,
+              blind: verified.coverage.blind,
+            },
+            sanitisedAt: new Date().toISOString(),
+          },
+        });
+        const result = await saveSanitisedSample(doc);
+        // Named after where it shows up (Samples → Sanitize, and labelled in Samples → Library),
+        // and a browser-only copy inside Cribl is reported as the warning it is.
+        libraryNote = !result.ok ? `Not added to the library: ${result.error || 'save failed'}.`
+          : result.warning ? `Not kept in the sample library: ${result.warning}`
+          : 'Also saved as a sanitised sample — find it under Samples → Sanitize (and labelled Sanitised in Samples → Library).';
+        if (result.ok) onLibraryChanged?.();
+      } catch (err) {
+        libraryNote = `Not added to the library: ${err instanceof Error ? err.message : String(err)}`;
+      } finally {
+        setBusy('');
+      }
+    }
+    onPick?.({
+      events: run.events,
+      sourcetype,
+      sanitised: true,
+      origin: 'own',
+      label: sourceLabel || `${sourceMode} sample`,
+      warning: warning || (run.changed ? null : 'Nothing in this sample needed replacing.'),
+      libraryNote,
+    });
+    onClose();
+  }
+
   function applyPlan() {
     setError('');
     setSurvivors([]);
@@ -911,7 +1141,7 @@ export function SanitizeWizard({
         return;
       }
       if (!run.structure.ok) {
-        setError('Sanitising shifted a delimiter or whitespace boundary — narrow the picks marked in red, then apply again.');
+        blockOnStructure(run.structure.problems);
         return;
       }
       // Warn ONLY when sanitisation DEGRADED parseability — the raw sample parsed and the
@@ -945,6 +1175,10 @@ export function SanitizeWizard({
       setGroupSampleName(`${sanitisedSampleKey(sourcetype, recognition?.format.id).replace(/::/g, '__')}.log`);
       setStep('save');
     } catch (err) {
+      // A broken structure gets the live banner (it clears as entries are unticked); any
+      // other block keeps its own message.
+      const structure = checkStructurePreserved(raw, applySanitisation(raw, plan?.entries || []));
+      if (!structure.ok) { blockOnStructure(structure.problems); return; }
       setError(err instanceof Error ? err.message : String(err));
       if (err instanceof SanitisationBlocked && err.survivors.length) setSurvivors(err.survivors);
       // Bring the blocker into view — it renders at the top of the body, above the fold.
@@ -1014,6 +1248,8 @@ export function SanitizeWizard({
     const saved = await saveSanitisedSample(buildDoc());
     if (!saved.ok) throw new Error(saved.error || 'Could not save in the app library.');
     onLibraryChanged?.();
+    // Browser-only inside Cribl is lost on reload: shown as a failure card, not a tick.
+    if (saved.warning) throw new Error(saved.warning);
     return saved.storedIn === 'config' ? 'Saved in config/sanitised-samples/'
       : saved.storedIn === 'app-kv' ? 'Saved in this app installation' : 'Saved in this browser';
   }
@@ -1045,13 +1281,13 @@ export function SanitizeWizard({
     // screen whose backdrop closes on click, and a leaked click dismissed both dialogs.
     // Embedded: no modal semantics (it IS the page) — a region, not a dialog.
     <div className={embedded ? 'sz-overlay sz-embedded' : 'sz-overlay'}
-      role={embedded ? 'region' : 'dialog'} aria-modal={embedded ? undefined : true} aria-label="Sanitize a sample"
+      role={embedded ? 'region' : 'dialog'} aria-modal={embedded ? undefined : true} aria-label={pickMode ? 'Choose a sample' : 'Sanitize a sample'}
       onClick={event => event.stopPropagation()}>
       <div className="sz-modal">
         <header className="sz-header">
           <div>
-            <div className="sz-eyebrow">{applyMode ? 'Pack generator' : 'Sample library'}</div>
-            <h2>{applyMode ? 'Sanitize this sample' : 'Sanitize a sample'}</h2>
+            <div className="sz-eyebrow">{pickMode ? (pickTitle || 'Batch pre-flight') : applyMode ? 'Pack generator' : 'Sample library'}</div>
+            <h2>{pickMode ? 'Choose a sample' : applyMode ? 'Sanitize this sample' : 'Sanitize a sample'}</h2>
           </div>
           {!embedded && <button className="sz-close" onClick={onClose} aria-label="Close">×</button>}
         </header>
@@ -1089,40 +1325,84 @@ export function SanitizeWizard({
           {result && <div className="sz-note sz-success">{result}</div>}
 
           {step === 'events' && <>
-            <h3>Choose customer events</h3>
+            <h3>{pickMode ? 'Where do this row\'s events come from?' : 'Choose customer events'}</h3>
             {/* Same source options and tile layout as the new-pack "provide sample events"
                 screen — minus AI-generate, which produces synthetic data that needs no
-                sanitising. */}
+                sanitising. Pick mode adds the two tiles that need no sanitising in front. */}
             <div className="field">
               <label>How do you want to provide sample events?</label>
               <div className="tile-grid" style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))' }}>
-                <div className={sourceMode === 'upload' ? 'tile active' : 'tile'}
-                  onClick={() => setSourceMode('upload')}>
+                {pickMode && <>
+                  <div className={`tile${pickSource === 'library' ? ' active' : ''}${!libSample ? ' tile-disabled' : ''}`}
+                    aria-disabled={!libSample}
+                    onClick={() => { if (libSample) setPickSource('library'); }}>
+                    <span className="tile-icon">{'\u{1F4DA}'}</span>
+                    <strong className="tile-name">Library sample</strong>
+                    <span className="tile-meta">{libLoading ? 'Looking…'
+                      : libSample ? `${libSample.events.length} events · ${libSample.label}`
+                      : `None for ${initialSourcetype || 'this sourcetype'}`}</span>
+                  </div>
+                  <div className={`tile${pickSource === 'saved' ? ' active' : ''}${!saved.length ? ' tile-disabled' : ''}`}
+                    aria-disabled={!saved.length}
+                    onClick={() => { if (saved.length) setPickSource('saved'); }}>
+                    <span className="tile-icon">{'\u{1F6E1}\u{FE0F}'}</span>
+                    <strong className="tile-name">Saved sample</strong>
+                    <span className="tile-meta">{saved.length ? `${saved.length} sanitised in the library` : 'None saved yet'}</span>
+                  </div>
+                </>}
+                <div className={!pickSource && sourceMode === 'upload' ? 'tile active' : 'tile'}
+                  onClick={() => { setPickSource(null); setSourceMode('upload'); }}>
                   <span className="tile-icon">{'\u{1F4C1}'}</span>
                   <strong className="tile-name">Upload file</strong>
                   <span className="tile-meta">JSON, log, txt, csv</span>
                 </div>
-                <div className={sourceMode === 'group' ? 'tile active' : 'tile'}
-                  onClick={() => setSourceMode('group')}>
+                <div className={!pickSource && sourceMode === 'group' ? 'tile active' : 'tile'}
+                  onClick={() => { setPickSource(null); setSourceMode('group'); }}>
                   <span className="tile-icon">{'\u{1F4BE}'}</span>
                   <strong className="tile-name">Group sample</strong>
                   <span className="tile-meta">Pick from worker group</span>
                 </div>
-                <div className={sourceMode === 'paste' ? 'tile active' : 'tile'}
-                  onClick={() => setSourceMode('paste')}>
+                <div className={!pickSource && sourceMode === 'paste' ? 'tile active' : 'tile'}
+                  onClick={() => { setPickSource(null); setSourceMode('paste'); }}>
                   <span className="tile-icon">{'\u{1F4CB}'}</span>
                   <strong className="tile-name">Paste events</strong>
                   <span className="tile-meta">One per line or JSON</span>
                 </div>
-                <div className={sourceMode === 'live-capture' ? 'tile active' : 'tile'}
-                  onClick={() => { setSourceMode('live-capture'); setCaptureFilter('true'); }}>
+                <div className={!pickSource && sourceMode === 'live-capture' ? 'tile active' : 'tile'}
+                  onClick={() => { setPickSource(null); setSourceMode('live-capture'); setCaptureFilter('true'); }}>
                   <span className="tile-icon">{'\u{1F4E1}'}</span>
                   <strong className="tile-name">Live capture</strong>
                   <span className="tile-meta">Capture from worker group</span>
                 </div>
               </div>
             </div>
-            {sourceMode === 'upload' && <div className="sz-drop" onClick={() => fileRef.current?.click()}>
+            {pickSource === 'library' && libSample && <div className="sz-capture-live">
+              <div className="sz-capture-live-head">
+                <strong>{libSample.events.length} event{libSample.events.length === 1 ? '' : 's'} · {libSample.label}</strong>
+                <span className="sz-note">public vendor data — no sanitising needed</span>
+              </div>
+              <div className="sz-capture-live-body">
+                {libSample.events.slice(0, 20).map((evt, i) => <div key={i} className="sz-capture-line">{evt}</div>)}
+              </div>
+            </div>}
+            {pickSource === 'saved' && <div className="sz-sample-search">
+              <input value={savedSearch} onChange={event => setSavedSearch(event.target.value)}
+                placeholder="Search saved samples by sourcetype…" aria-label="Search saved samples" />
+              <div className="sz-sample-list" role="listbox">
+                {savedList.length === 0 && <div className="sz-sample-empty">No saved samples match your search.</div>}
+                {savedList.map(row => {
+                  const selected = savedKey === row.key;
+                  return <button type="button" key={row.key} role="option" aria-selected={selected}
+                    className={`sz-sample-row${selected ? ' sz-sample-row-sel' : ''}`}
+                    onClick={() => setSavedKey(row.key)}>
+                    <span className="sz-sample-name">{row.sourcetype}</span>
+                    {row.format && <span className="sz-sample-pack">{row.format}</span>}
+                    <span className="sz-sample-count">{row.events} events</span>
+                  </button>;
+                })}
+              </div>
+            </div>}
+            {!pickSource && sourceMode === 'upload' && <div className="sz-drop" onClick={() => fileRef.current?.click()}>
               <strong>{sourceLabel || 'Choose a .log, .txt or .json file'}</strong>
               <small>{raw ? `${raw.split('\n').filter(Boolean).length} events loaded` : 'The file stays in this browser.'}</small>
               {/* The input is a CHILD of the drop zone whose onClick calls fileRef.click(); a
@@ -1139,10 +1419,10 @@ export function SanitizeWizard({
                     .finally(() => { input.value = ''; });
                 }} />
             </div>}
-            {sourceMode === 'paste' && <textarea className="sz-textarea" rows={12} value={raw}
+            {!pickSource && sourceMode === 'paste' && <textarea className="sz-textarea" rows={12} value={raw}
               onChange={event => { setRaw(event.target.value); setSourceLabel('pasted events'); }}
               placeholder="Paste one event per line…" />}
-            {sourceMode === 'group' && <div className="sz-group-pick">
+            {!pickSource && sourceMode === 'group' && <div className="sz-group-pick">
               <label className="sz-field">Worker group
                 <select value={groupId} onChange={event => { setGroupId(event.target.value); setSampleId(''); setSamplePackId(''); setSampleSearch(''); }}>
                   <option value="">Choose a group…</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name || group.id}</option>)}
@@ -1168,7 +1448,7 @@ export function SanitizeWizard({
                 </div>
               </div>}
             </div>}
-            {sourceMode === 'live-capture' && <div className="sz-capture">
+            {!pickSource && sourceMode === 'live-capture' && <div className="sz-capture">
               <p className="sz-note">Captures real events flowing through the selected worker group. Only groups with a connected worker are listed. Ensure traffic is actively being processed.</p>
               <label className="sz-field">Worker group
                 <select value={groupId} onChange={event => setGroupId(event.target.value)}>
@@ -1209,7 +1489,7 @@ export function SanitizeWizard({
           </>}
 
           {step === 'source' && <>
-            <h3>Confirm the source</h3>
+            <h3>{pickMode ? 'Confirm the sourcetype this sample names' : 'Confirm the source'}</h3>
             <div className="sz-detected"><b>{recognition?.display || 'Source not recognised'}</b><span>auto-detected · {recognition?.confidence} confidence · {recognition?.method} · offline</span></div>
             <p>{recognition?.reason}</p>
             {!!recognition?.alternatives?.length && <div className="sz-note" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -1482,17 +1762,36 @@ export function SanitizeWizard({
                               <button type="button" className={partMatchBy === 'shape' ? 'on' : ''}
                                 onMouseDown={event => event.preventDefault()}
                                 onClick={() => setPartMatchBy('shape')}>Based on wildcards — any value like it</button>
+                              <button type="button" className={partMatchBy === 'any' ? 'on' : ''}
+                                onMouseDown={event => event.preventDefault()}
+                                onClick={() => setPartMatchBy('any')}>Any text — names with . _ @ \ too</button>
                               <button type="button" className={partMatchBy === 'exact' ? 'on' : ''}
                                 onMouseDown={event => event.preventDefault()}
                                 onClick={() => setPartMatchBy('exact')}>Exact — only this value</button>
                             </div>
+                            {/* What the rest of the selection pins the part to: this exact text
+                                (one place) or the same shape (every line laid out like it). */}
+                            <div className="sanitise-q-sub">Around it</div>
+                            <div className="sanitise-seg-toggle">
+                              <button type="button" className={partContext === 'exact' ? 'on' : ''}
+                                onMouseDown={event => event.preventDefault()}
+                                onClick={() => setPartContext('exact')}>This exact text</button>
+                              <button type="button" className={partContext === 'shape' ? 'on' : ''}
+                                onMouseDown={event => event.preventDefault()}
+                                onClick={() => setPartContext('shape')}>Same shape — any IP, date, number</button>
+                            </div>
                             {partMask ? (
                               <div className="sanitise-q-note">
-                                {partMatchBy === 'shape' ? (
-                                  <><b>Any</b> value shaped like <code>{partMask.shape.groups.map(g => g.classRe).join(' · ')}</code> in this spot — the punctuation around it stays.</>
+                                {partMatchBy === 'exact' ? (
+                                  <><b>Only</b> <code>{partMask.shape.groups.map(g => g.sample).join(', ')}</code> where it sits</>
+                                ) : partMatchBy === 'any' ? (
+                                  <><b>Any</b> text up to the next space or bracket (not a lone <code>-</code>)</>
                                 ) : (
-                                  <><b>Only</b> <code>{partMask.shape.groups.map(g => g.sample).join(', ')}</code> where it sits here — other values in the same spot are left alone.</>
+                                  <><b>Any</b> value shaped like <code>{partMask.shape.groups.map(g => g.classRe).join(' · ')}</code></>
                                 )}
+                                {partContext === 'shape'
+                                  ? <> — between text of the <b>same shape</b> as the rest of the selection · {partMask.matches === 1 ? '1 place' : `${partMask.matches} places`}.</>
+                                  : <> — the text around it must match exactly · {partMask.matches === 1 ? '1 place' : `${partMask.matches} places`}.</>}
                               </div>
                             ) : (
                               <div className="sanitise-q-note">Pick a part of the value above to mask.</div>
@@ -1572,9 +1871,13 @@ export function SanitizeWizard({
               const row = (entry: SanitiseEntry) => {
                 const patch = patternPatchDisplay(entry);
                 return (
-                  <label key={`${entry.kind}:${entry.original}`}
+                  /* A div, not a label: a label row toggled the tick on a click ANYWHERE in it, so
+                     clicking the name to read or copy it silently unticked the row. Only the
+                     checkbox toggles now. */
+                  <div key={`${entry.kind}:${entry.original}`}
                     className={entry.enabled ? 'sanitise-row' : 'sanitise-row sanitise-row-off'}>
                     <input type="checkbox" checked={entry.enabled}
+                      aria-label={`Replace ${patch ? patch.from : entry.original}`}
                       onChange={() => toggleEntry(entry.original, entry.kind)} />
                     <span className={entry.kind === 'secret' ? 'sanitise-kind sanitise-kind-secret' : 'sanitise-kind'}>
                       {entry.kind === 'ipv4' || entry.kind === 'ipv6' ? 'IP' : entry.kind === 'pii' ? 'PII' : entry.kind}
@@ -1584,12 +1887,15 @@ export function SanitizeWizard({
                     </code>
                     <span className="sanitise-arrow">{'→'}</span>
                     <input className="sanitise-to" value={patch ? patch.to : entry.alias} spellCheck={false}
-                      onChange={event => updateAlias(entry.original, entry.kind, event.target.value)} />
+                      onChange={event => updateAlias(entry.original, entry.kind,
+                        // A pick row shows only its stand-in(s); splice the edit back into the
+                        // full-match alias so the punctuation and context around it stay put.
+                        patch ? rebuildPatternAlias(entry, event.target.value) : event.target.value)} />
                     <span className="sanitise-count">{entry.count}{'×'}</span>
                     <span className="sanitise-via" title={patch ? entry.original : undefined}>
                       {patch ? `${entry.via} · in ${entry.original}` : entry.via}
                     </span>
-                  </label>
+                  </div>
                 );
               };
               return groupEntries(plan.entries).map(group => {
@@ -1649,6 +1955,10 @@ export function SanitizeWizard({
             </details>
             {!plan?.entries.length && <div className="sz-note sz-danger">No identifying values were found. Add a replacement rule before this sample can be saved.</div>}
             {!!plan?.entries.length && enabled === 0 && <div className="sz-note">Everything is unticked — tick at least one value (or a group header) to enable Apply.</div>}
+            {pickMode && !embedded && <label className="sz-note" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input type="checkbox" checked={addToLibrary} onChange={event => setAddToLibrary(event.target.checked)} />
+              Also add it to the sample library, so the next batch can pick it as a saved sample
+            </label>}
           </>}
 
           {step === 'save' && applied && <>
@@ -1728,15 +2038,20 @@ export function SanitizeWizard({
         </main>
 
         <footer className="sz-footer">
-          {applyMode && <button className="sz-secondary" onClick={onClose}>Cancel</button>}
+          {(applyMode || pickMode) && <button className="sz-secondary" onClick={onClose}>Cancel</button>}
           {/* Back stays available on the save step until a durable destination has committed —
               once the sample is out there is nothing to go back and re-edit. */}
           {!applyMode && activeIndex > 0 && !(step === 'save' && (actionDone.local || actionDone.upload || actionDone.publish)) && <button className="sz-secondary"
             onClick={step === 'save' ? backFromSave : () => setStep(steps[activeIndex - 1].id)}>Back</button>}
           <span />
-          {step === 'events' && <button className="sz-primary" disabled={!!busy} onClick={() => void identify()}>{busy || 'Identify source'}</button>}
-          {step === 'source' && <button className="sz-primary" onClick={confirmSource}>Review sanitisation</button>}
-          {step === 'sanitize' && <button className="sz-primary" disabled={!enabled} onClick={applyPlan}>{applyMode ? 'Apply & use this sample' : 'Apply and verify'}</button>}
+          {step === 'events' && <button className="sz-primary" disabled={!!busy || (pickSource === 'saved' && !savedKey)} onClick={() => void identify()}>{busy || (pickMode ? 'Identify sourcetype' : 'Identify source')}</button>}
+          {step === 'source' && pickMode && pickSource && <button className="sz-primary" onClick={pickAsIs}>Use for this row</button>}
+          {step === 'source' && pickMode && !pickSource && <button className="sz-secondary" onClick={pickAsIs}
+            title="The events stay as they are; the AI steps follow Settings → Require sanitised samples">Use without sanitising</button>}
+          {step === 'source' && !(pickMode && pickSource) && <button className="sz-primary" onClick={confirmSource}>Review sanitisation</button>}
+          {step === 'sanitize' && pickMode && <button className="sz-primary" disabled={!!busy || (!!plan?.entries.length && !enabled)}
+            onClick={() => void pickSanitised()}>{busy || 'Sanitize & use for this row'}</button>}
+          {step === 'sanitize' && !pickMode && <button className="sz-primary" disabled={!enabled} onClick={applyPlan}>{applyMode ? 'Apply & use this sample' : 'Apply and verify'}</button>}
           {/* No "Save selected" and no "Done" — each card commits itself and nothing is forced,
               so the save step needs no primary button; closing is the modal ✕ / Back. */}
         </footer>

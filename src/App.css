@@ -2335,71 +2335,117 @@ main {
   100% { transform: translateX(350%); }
 }
 
-/* --- GoatBar: the Cribl goat grazing a field of data ---
+/* --- GoatBar: the Cribl goat grazing its way along the progress track ---
    Reusable progress bar. Two modes:
-   • indeterminate (no --pct): goat slowly creeps left→right eating the grass,
-     loops (for AI analysis and other "working…" states).
-   • determinate (--pct set 0..100): goat + eaten edge sit at the real percent.
-   The goat STANDS ON THE FLOOR (bottom line); grass rises around its legs;
-   grazed grass becomes bare white. Pure CSS + one small webp asset. */
+   • determinate (--pct 0..100): a teal striped fill up to the goat's mouth;
+     grass tufts ahead of it; bit crumbs pop as it eats; a % bubble rides along.
+   • indeterminate (no --pct): a shimmer runs the track while the goat roams
+     back and forth, turning at each end (for AI analysis and "working…").
+   Pure CSS + one small webp asset (faces right, head down). */
 .goatbar {
+  --x: calc(var(--pct, 0) * 1%);
   position: relative;
   display: block;
   width: 100%;                                 /* must fill its container, not shrink as a flex item */
   flex: none;
-  height: 44px;
-  margin-bottom: 14px;
-  border-bottom: 2px solid #e2e6ea;           /* the floor line */
+  height: 62px;
+  margin: 2px 0 14px;
 }
+.goatbar .gb-track {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 12px;
+  border-radius: 999px; overflow: hidden;
+  background: #eef2f5; box-shadow: inset 0 1px 2px rgba(16,24,40,.08);
+}
+.goatbar .gb-fill {
+  position: absolute; top: 0; bottom: 0; left: 0; width: var(--x);
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--pg-teal-dark, #009a9a), var(--pg-teal, #00b8b8) 70%, #3fd6c8);
+  transition: width .6s cubic-bezier(.3,.7,.4,1);
+}
+.goatbar .gb-fill::after {
+  content: ''; position: absolute; inset: 0;
+  background: repeating-linear-gradient(-45deg, rgba(255,255,255,.24) 0 7px, transparent 7px 14px);
+  background-size: 19.8px 19.8px;
+  animation: gb-stripes .9s linear infinite;
+}
+/* grass tufts still to eat: from the goat's mouth to the end of the track */
 .goatbar .gb-grass {
-  position: absolute; left: 0; right: 0; bottom: 0; height: 20px; overflow: hidden;
+  position: absolute; left: var(--x); right: 4px; bottom: 9px; height: 11px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='22' height='11'%3E%3Cpath d='M1 11L3.5 4 5 11zM4 11L7 1l2 10zM8 11l2.5-6L12 11z' fill='%233fae5a'/%3E%3Cpath d='M14 11l2-5 1.5 5zM16.5 11L19 2.5 21 11z' fill='%232f8f47'/%3E%3C/svg%3E") repeat-x left bottom;
+  transform-origin: bottom; animation: gb-sway 2.4s ease-in-out infinite alternate;
+  transition: left .6s cubic-bezier(.3,.7,.4,1);
+  pointer-events: none;
 }
-.goatbar .gb-blades {
-  position: absolute; inset: 0;
-  background-image:
-    repeating-linear-gradient(90deg, #3fae5a 0 2px, transparent 2px 9px),
-    repeating-linear-gradient(90deg, #2f8f47 4px 5px, transparent 5px 18px);
-  -webkit-mask: linear-gradient(180deg, transparent 0 3px, #000 8px 100%);
-          mask: linear-gradient(180deg, transparent 0 3px, #000 8px 100%);
-  animation: gb-sway 2s ease-in-out infinite alternate;
+.goatbar .gb-rider {
+  position: absolute; bottom: 5px; width: 51px; height: 36px;
+  left: clamp(44px, var(--x), calc(100% - 8px));
+  transform: translateX(-86%);                 /* mouth (bottom-right of the art) on the edge */
+  transition: left .6s cubic-bezier(.3,.7,.4,1);
+  z-index: 2; pointer-events: none;
 }
-.goatbar .gb-bits {
-  position: absolute; left: 0; right: 0; bottom: 2px;
-  font: 700 8px/1 'SF Mono', ui-monospace, monospace;
-  color: rgba(0,109,109,.28); white-space: nowrap; letter-spacing: 5px; overflow: hidden;
-}
-/* eaten grass → bare white floor, with a faint green nibble edge */
-.goatbar .gb-eaten {
-  position: absolute; left: 0; bottom: 0; height: 20px; width: 0; background: #fff; z-index: 2;
-}
-.goatbar .gb-eaten::after {
-  content: ''; position: absolute; right: -1px; top: 0; bottom: 0; width: 6px;
-  background: linear-gradient(90deg, transparent, rgba(63,174,90,.3));
-}
-/* goat stands on the floor (bottom:0); grass (20px) overlaps its lower legs */
+.goatbar .gb-face { position: absolute; inset: 0; transform-origin: 60% bottom; }
 .goatbar .gb-goat {
-  position: absolute; bottom: 0; left: 0; height: 44px; width: auto;
-  transform: translateX(-50%); transform-origin: bottom center; z-index: 3;
-  pointer-events: none; filter: drop-shadow(0 2px 2px rgba(0,0,0,.13));
-  animation: gb-munch 1s ease-in-out infinite;
+  display: block; height: 36px; width: auto;
+  transform-origin: 70% bottom;
+  filter: drop-shadow(0 2px 2px rgba(0,0,0,.14));
+  animation: gb-munch 1.1s ease-in-out infinite;
 }
-@keyframes gb-sway  { 0%{transform:skewX(-2.5deg)} 100%{transform:skewX(2.5deg)} }
-@keyframes gb-munch { 0%,100%{transform:translateX(-50%) translateY(0)} 50%{transform:translateX(-50%) translateY(1px)} }
+.goatbar .gb-crumbs i {
+  position: absolute; right: 2px; bottom: 2px;
+  font: normal 700 8px/1 'SF Mono', ui-monospace, monospace;
+  color: var(--pg-teal-text, #006d6d); opacity: 0;
+  animation: gb-crumb 1.6s ease-out infinite;
+}
+.goatbar .gb-crumbs i:nth-child(2) { animation-delay: .4s; --dx: 9px; }
+.goatbar .gb-crumbs i:nth-child(3) { animation-delay: .8s; --dx: -3px; }
+.goatbar .gb-crumbs i:nth-child(4) { animation-delay: 1.2s; --dx: 5px; }
+.goatbar .gb-bubble {
+  position: absolute; bottom: 38px; left: 40%; transform: translateX(-50%);
+  padding: 2px 7px; border-radius: 10px;
+  background: var(--pg-ink, #1a1a2e); color: #fff;
+  font-size: 10.5px; font-weight: 700; line-height: 1.4; font-variant-numeric: tabular-nums; white-space: nowrap;
+  box-shadow: 0 2px 6px rgba(16,24,40,.18);
+}
+.goatbar .gb-bubble::after {
+  content: ''; position: absolute; left: 50%; bottom: -3px; width: 6px; height: 6px;
+  background: inherit; transform: translateX(-50%) rotate(45deg);
+}
+.goatbar.det.full .gb-grass, .goatbar.det.full .gb-crumbs { display: none; }
+/* At 100% the work is over: the goat stops munching and the stripes stop running. */
+.goatbar.det.full .gb-goat, .goatbar.det.full .gb-fill::after { animation: none; }
 
-/* Indeterminate: sweep the eaten edge + walk the goat, looping. */
-.goatbar.indet .gb-eaten { animation: gb-eat 20s linear infinite; }
-.goatbar.indet .gb-goat  { animation: gb-walk 20s linear infinite, gb-munch 1s ease-in-out infinite; }
-@keyframes gb-eat  { 0%{width:0} 97%{width:95%} 100%{width:95%} }
-@keyframes gb-walk { 0%{left:5%} 97%{left:90%} 100%{left:90%} }
+/* Indeterminate: shimmer across the track, goat walks there and back. */
+.goatbar.indet .gb-fill { width: 100%; background: #e6fafa; }
+.goatbar.indet .gb-fill::after {
+  background: linear-gradient(90deg, transparent, rgba(0,184,184,.35), transparent);
+  background-size: 40% 100%; background-repeat: no-repeat;
+  animation: gb-shimmer 1.8s ease-in-out infinite;
+}
+.goatbar.indet .gb-grass { left: 4px; opacity: .55; }
+.goatbar.indet .gb-rider { left: auto; transform: none; animation: gb-roam 9s ease-in-out infinite alternate; }
+.goatbar.indet .gb-face  { animation: gb-turn 18s linear infinite; }
+.goatbar.indet .gb-goat  { animation: gb-gait .55s ease-in-out infinite; }
+.goatbar.indet .gb-crumbs { display: none; }
 
-/* Determinate: position driven by --pct (0..100). */
-.goatbar.det .gb-eaten { width: calc(var(--pct, 0) * 0.9%); transition: width .5s ease; }
-.goatbar.det .gb-goat  { left: calc(var(--pct, 0) * 0.9% + 4%); transition: left .5s ease; }
+@keyframes gb-stripes { to { background-position: 19.8px 0; } }
+@keyframes gb-shimmer { 0% { background-position: -40% 0; } 100% { background-position: 140% 0; } }
+@keyframes gb-sway  { 0% { transform: skewX(-4deg); } 100% { transform: skewX(4deg); } }
+@keyframes gb-munch { 0%,100% { transform: rotate(0); } 45% { transform: rotate(2.5deg) translateY(1px); } }
+@keyframes gb-gait  { 0%,100% { transform: translateY(0) rotate(0); } 50% { transform: translateY(-2px) rotate(-1.5deg); } }
+@keyframes gb-crumb {
+  0%   { opacity: 0; transform: translate(0, 0) scale(.6); }
+  15%  { opacity: .9; }
+  100% { opacity: 0; transform: translate(var(--dx, 2px), -22px) scale(1); }
+}
+/* roam and turn share one clock: 9s out, 9s back, face flips at each end */
+@keyframes gb-roam { from { left: 0; } to { left: calc(100% - 51px); } }
+@keyframes gb-turn { 0%,49.99% { transform: scaleX(1); } 50%,100% { transform: scaleX(-1); } }
 
 @media (prefers-reduced-motion: reduce) {
-  .goatbar .gb-blades, .goatbar .gb-goat, .goatbar.indet .gb-eaten { animation: none; }
-  .goatbar.indet .gb-eaten { width: 55%; }
-  .goatbar.indet .gb-goat  { left: 55%; }
+  .goatbar .gb-fill::after, .goatbar .gb-grass, .goatbar .gb-goat, .goatbar .gb-crumbs i,
+  .goatbar.indet .gb-rider, .goatbar.indet .gb-face { animation: none; }
+  .goatbar .gb-crumbs { display: none; }
+  .goatbar.indet .gb-rider { left: calc(50% - 25px); }
 }
 
 .ai-progress-content {
@@ -2903,6 +2949,13 @@ main {
 }
 .batch-copy-log-btn:hover { background: #e6fafa; }
 .batch-copy-log-btn:active { background: #00b8b8; color: #fff; }
+.batch-copy-log-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.batch-export-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+/* More than one Parser / regex_extract in a built batch pipeline — worth a look. */
+.batch-fn-flag {
+  font-size: 10px; font-weight: 600; padding: 1px 5px; border-radius: 3px;
+  background: #fff4e5; color: #8a4b00; border: 1px solid #f5c98b;
+}
 
 .batch-fields-table td code {
   background: #f0f5ff;
@@ -3317,12 +3370,6 @@ main {
 .score-badge.warn { background: #faad14; color: #333; }
 .score-badge.fail { background: #f5222d; }
 .score-badge.unknown { background: #d9d9d9; color: #666; }
-
-.concurrency-selector {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
 
 .conflict-nav {
   display: flex;
@@ -3866,6 +3913,19 @@ main {
   background: #e6fafa; color: #006d6d;
 }
 .demo-route-fmt.lake { background: #f0e6ff; color: #531dab; }
+.demo-route-fmt.pp { background: #fff7e6; color: #ad4e00; }
+.demo-route-group + .demo-route-group { margin-top: 6px; }
+/* Demo v2: read-only preview of the route block that will be written. */
+.demo-plan-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.demo-plan-table th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: #8c8c8c; padding: 6px 8px; border-bottom: 1px solid #edf0f3; }
+.demo-plan-table td { padding: 6px 8px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
+.demo-plan-table code { font-size: 11px; word-break: break-all; }
+.demo-plan-table tr.pp td:first-child { color: #ad4e00; }
+.demo-src-matrix { margin-bottom: 6px; }
+.demo-src-matrix th:not(:first-child), .demo-src-matrix td:not(:first-child) { text-align: center; vertical-align: middle; }
+.demo-src-matrix th.pp { color: #ad4e00; }
+.demo-src-matrix td.pp { background: #fffaf3; }
+.demo-plan-table tr.term td { color: #8c8c8c; }
 .demo-route-out {
   font-size: 11px; color: #8c8c8c; font-family: ui-monospace, monospace;
   background: #f5f5f5; padding: 2px 8px; border-radius: 6px;
@@ -4212,6 +4272,65 @@ main {
 }
 .preflight-accept-btn:hover { background: #e6f4f4; }
 .preflight-accept-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.preflight-gate {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+  margin-top: 6px; max-width: 26rem; font-size: 12px; line-height: 1.35;
+}
+.preflight-gate-note { color: #555; }
+.preflight-gate-picks { display: flex; flex-wrap: wrap; gap: 4px; }
+.preflight-gate-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.preflight-gate-input { min-width: 10rem; flex: 1; }
+.preflight-gate-ok { color: #237804; font-weight: 600; }
+.preflight-canonical-editor {
+  display: flex; flex-direction: column; align-items: stretch; gap: 5px;
+  min-width: 240px; max-width: 440px;
+}
+.preflight-gate-pending { display: flex; flex-wrap: wrap; gap: 4px; }
+.preflight-pending-row {
+  border: 1px solid #d48806; background: #fff; color: #874d00;
+  border-radius: 10px; padding: 1px 8px; font: inherit; font-size: 12px; font-weight: 600;
+  cursor: pointer;
+}
+.preflight-pending-row:hover { background: #fff7e6; }
+.preflight-suggestions { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; }
+.preflight-suggestions-label {
+  font-size: 11px; font-weight: 700; color: #344054;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.preflight-suggestions-kind { display: block; font-size: 11px; color: #667085; margin-top: 2px; }
+.preflight-suggestion {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  margin: 0 4px 4px 0; padding: 3px 8px;
+  border: 1px solid #b2ddd9; border-radius: 12px;
+  background: #f3fbfb; color: #0b3b3b;
+  font: inherit; font-size: 12px; cursor: pointer; text-align: left;
+}
+.preflight-suggestion:hover { border-color: #00b8b8; background: #e6f7f7; }
+.preflight-suggestion.is-current { border-color: #00b8b8; background: #d9f3f3; font-weight: 600; }
+.preflight-suggestion-why { font-size: 10px; font-weight: 600; color: #667085; white-space: nowrap; }
+/* Sample column: sits before the sourcetype, which is read from it. */
+.preflight-sample-cell { min-width: 200px; max-width: 320px; vertical-align: top; }
+.preflight-sample-cell > * + * { margin-top: 4px; }
+.preflight-sample-cell .preflight-sample-pick { margin-left: 0; }
+.preflight-sample-pick.is-primary { background: #006d6d; color: #fff; }
+.preflight-sample-pick.is-primary:hover:not(:disabled) { background: #005858; }
+.preflight-sample-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: #344054; }
+.preflight-sanitized-badge {
+  display: inline-block; padding: 1px 8px;
+  border-radius: 10px; background: #e6f4ea; color: #137333;
+  font-size: 11px; font-weight: 700;
+}
+.preflight-sample-peek {
+  margin: 0; max-height: 72px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+  font-size: 11px; line-height: 1.35;
+  background: #f6f8fa; border: 1px solid #e4e7ec; border-radius: 4px; padding: 6px 8px;
+}
+.preflight-canonical-input { width: 100%; min-width: 0; }
+.preflight-canonical-actions {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px;
+}
+.preflight-canonical-actions .preflight-accept-btn { margin-left: 0; }
 /* Top-of-screen action bar for unresolved sourcetypes on the first preflight
    screen: bulk "remove all" vs one-by-one stepper (prev/next). */
 .preflight-unknown-bar {
@@ -4726,6 +4845,8 @@ main {
 }
 .sanitise-seg-toggle button + button { border-left: 1px solid #d7dee4; }
 .sanitise-seg-toggle button.on { background: #13a6a6; color: #fff; font-weight: 600; }
+/* Sub-label for the second toggle in the part flow ("Around it": exact text vs same shape). */
+.sanitise-q-sub { font-size: 11px; font-weight: 600; color: #567; margin: 10px 0 4px; }
 .sanitise-choices-apply { align-self: flex-start; margin-top: 4px; }
 .sanitise-choices-apply:disabled { opacity: 0.5; cursor: not-allowed; }
 /* The guided picks and the "write your own regex" entry sit side by side under the choices. */
@@ -5184,6 +5305,22 @@ main {
 .sr-download { border: 1px solid #b3f0f0; background: #e6fbfb; color: #007c83; border-radius: 7px;
   padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; margin-bottom: 6px; }
 .sr-download:hover { background: #d0f5f5; }
+.sr-visualizer { border: 1px solid #d6cafc; background: #f3effe; color: #5b2cb3; border-radius: 7px;
+  padding: 6px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; white-space: nowrap; margin-bottom: 6px;
+  text-decoration: none; display: inline-flex; align-items: center; }
+.sr-visualizer:hover { background: #e6dcfc; }
+.batch-score-visualizer { color: #5b2cb3; text-decoration: none; font-size: 13px; margin-left: 4px; }
+.batch-score-visualizer:hover { opacity: 0.7; }
+/* Visualizer not installed / not checked: the control opens a notice instead of linking. */
+button.batch-score-visualizer { background: none; border: none; padding: 0; cursor: pointer; font: inherit; }
+.pv-wrap { position: relative; display: inline-block; }
+.pv-notice { position: absolute; top: calc(100% + 4px); z-index: 60; width: 300px; padding: 10px 12px;
+  background: #fff; border: 1px solid #d6cafc; border-radius: 8px; box-shadow: 0 6px 18px rgba(0,0,0,.12);
+  color: #1a1a2e; font-size: 12.5px; font-weight: 400; line-height: 1.45; white-space: normal; text-align: left; }
+.pv-notice-right { right: 0; } .pv-notice-left { left: 0; }
+.pv-notice-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 8px; }
+.pv-notice-actions a { color: #5b2cb3; font-weight: 600; }
+.pv-notice-actions button { background: none; border: none; padding: 0; color: #595959; cursor: pointer; font: inherit; }
 .sr-panel { padding: 18px 2px 2px; }
 
 /* ---- score header ---- */
@@ -5423,6 +5560,10 @@ main {
 
 .bg-run-trials { color: #595959; }
 
+/* The per-pack report that replaces "Built" — the batch screens' small button,
+   kept on one line inside the narrow Notes column. */
+.bg-run-pack-report { white-space: nowrap; }
+
 .bg-run-outcome { font-weight: 600; }
 .bg-run-table tbody tr[data-state="success"] .bg-run-outcome { color: #389e0d; }
 .bg-run-table tbody tr[data-state="error"] .bg-run-outcome { color: #cf1322; }
@@ -5562,3 +5703,23 @@ main {
   .bg-run-table .bg-run-col-idx { display: none; }
   .bg-run-notes { max-width: none; }
 }
+
+/* Build pack flow: short summary at the top of the Build screen (replaces the Review step) */
+
+/* Demo destinations: per-source choices + summary + Next stay in view under the
+   tall flow canvas; the table scrolls itself past ~5 sources. */
+.demo-dest-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 9;
+  flex-shrink: 0;
+  margin-top: 12px;
+  padding-top: 8px;
+  background: #fff;
+  border-top: 1px solid #f0f0f0;
+  box-shadow: 0 -6px 12px -8px rgba(0, 0, 0, 0.12);
+}
+.demo-dest-footer .demo-section-label { margin-top: 0; }
+.demo-dest-footer .demo-src-scroll { max-height: 32vh; overflow-y: auto; }
+.demo-dest-footer .demo-route-summary { margin-top: 8px; }
+.demo-dest-footer .nav { position: static; margin-top: 8px; border-top: 0; box-shadow: none; }

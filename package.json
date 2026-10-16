@@ -1,7 +1,7 @@
 {
   "name": "cc-sample-sanitizer",
   "private": true,
-  "version": "1.0.260",
+  "version": "1.0.261",
   "buildNumber": 778,
   "type": "module",
   "scripts": {

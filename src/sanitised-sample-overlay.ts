@@ -143,7 +143,9 @@ export async function saveSanitisedOverlay(
     try {
       const response = await fetch(overlayUrl(), {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        // text/plain, not application/json: App KV stores a JSON content-type body as
+        // "[object Object]", so the write "succeeds" and the next read finds nothing.
+        headers: { 'Content-Type': 'text/plain' },
         body,
       });
       if (response.ok) {

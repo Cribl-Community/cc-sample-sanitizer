@@ -21,6 +21,7 @@
  * import it through tsx. There is no mirrored copy to drift.
  */
 
+import { assessSampleUsable, splitNonEvents } from './sample-gate';
 import {
   canonicalizeSourcetype,
   getParserFieldNames,
@@ -266,6 +267,35 @@ function resolveAliasChain(expr: string, event: Record<string, unknown>): unknow
   return undefined;
 }
 
+/**
+ * The two branch conditions the emulator can decide: a regex test of one field
+ * (`/^\s*<Event[\s>]/.test(_raw)`, optionally negated) and a boolean flag an
+ * earlier eval computed that way (`__ps_xml`, `!__ps_xml`). A parser that reads
+ * more than one wire form gates each branch on one of these (windows_powershell:
+ * classic text vs Windows Event XML); running every branch on every line would
+ * count an XML event as a failed classic parse. Anything else is undecidable and
+ * returns undefined, so the function runs exactly as it always did.
+ */
+const REGEX_TEST = /^(!?)\s*\/((?:[^/\\\n]|\\.)+)\/([a-z]*)\.test\(\s*([A-Za-z_$][\w$]*)\s*\)$/;
+const FLAG_TEST = /^(!?)\s*([A-Za-z_$][\w$]*)$/;
+
+function emulateCondition(expr: unknown, event: Record<string, unknown>): boolean | undefined {
+  const e = String(expr ?? '').trim();
+  if (!e || e === 'true') return true;
+  if (e === 'false') return false;
+  const t = REGEX_TEST.exec(e);
+  if (t) {
+    const v = event[t[4]];
+    if (typeof v !== 'string') return undefined;
+    let re: RegExp;
+    try { re = new RegExp(t[2], t[3]); } catch { return undefined; }
+    return re.test(v) !== (t[1] === '!');
+  }
+  const f = FLAG_TEST.exec(e);
+  if (f && typeof event[f[2]] === 'boolean') return (event[f[2]] as boolean) !== (f[1] === '!');
+  return undefined;
+}
+
 interface EmulationResult {
   fields: Set<string>;
   /** True when at least one regex_extract/serde function was available to run. */
@@ -288,6 +318,8 @@ function emulateParse(fns: PipelineFunction[], rawLine: string): EmulationResult
   let emulatable = false, partial = false;
 
   for (const fn of fns) {
+    // A branch the event is not on does not run — and so cannot count as emulatable.
+    if (fn.filter !== undefined && emulateCondition(fn.filter, event) === false) continue;
     const conf = (fn.conf || {}) as Record<string, unknown>;
     if (fn.id === 'regex_extract') {
       const re = parseRegexLiteral(conf.regex);
@@ -306,7 +338,11 @@ function emulateParse(fns: PipelineFunction[], rawLine: string): EmulationResult
       }
     } else if (fn.id === 'serde' && String(conf.mode || 'extract') === 'extract') {
       const type = String(conf.type || '');
-      const src = event[String(conf.srcField || '_raw')];
+      // `__delim_src` is the whitespace-collapsed copy csvToDelimSerde's eval makes
+      // (evals are not emulated here).
+      const srcName = String(conf.srcField || '_raw');
+      const rawSrc = event[srcName === '__delim_src' && !(srcName in event) ? '_raw' : srcName];
+      const src = srcName === '__delim_src' && typeof rawSrc === 'string' ? rawSrc.trim().replace(/ {2,}/g, ' ') : rawSrc;
       if (typeof src !== 'string') { if (type) partial = true; continue; }
       if (type === 'json') {
         emulatable = true;
@@ -334,10 +370,11 @@ function emulateParse(fns: PipelineFunction[], rawLine: string): EmulationResult
           event[m[1]] = m[2];
           if (!m[1].startsWith('__')) fields.add(m[1]);
         }
-      } else if (type === 'csv') {
+      } else if (type === 'csv' || type === 'delim') {
         emulatable = true;
         const names = Array.isArray(conf.fields) ? (conf.fields as string[]) : [];
-        const cols = splitCsv(src, String(conf.delimChar || ','));
+        // Live, csv ignores delimChar and always splits on commas.
+        const cols = splitCsv(src, type === 'csv' ? ',' : String(conf.delimChar || ','));
         // A CSV parser only really read the line if the column count is in the
         // right ballpark — a 3-column line fed to a 47-column PAN parser has not
         // been parsed, it has been misread.
@@ -359,6 +396,12 @@ function emulateParse(fns: PipelineFunction[], rawLine: string): EmulationResult
       for (const entry of add) {
         const name = String(entry?.name || '');
         const expr = String(entry?.value ?? '').trim();
+        // An internal branch flag: its value, never a field.
+        if (name.startsWith('__') && REGEX_TEST.test(expr)) {
+          const flag = emulateCondition(expr, event);
+          if (flag !== undefined) event[name] = flag;
+          continue;
+        }
         if (!name || !ALIAS_CHAIN.test(expr)) continue;
         const v = resolveAliasChain(expr, event);
         if (v === undefined) continue;
@@ -427,13 +470,35 @@ export function verifyGeneratedSample(
   events: string[],
   opts: { synthetic?: boolean } = {},
 ): SampleVerification {
-  const list = (events || []).filter(e => typeof e === 'string' && e.trim().length > 0);
+  let list = (events || []).filter(e => typeof e === 'string' && e.trim().length > 0);
+  // A generated sample is judged line by line, not only as a whole (packtester
+  // audit 2026-10-09): `{}` padding is dropped, and ONE refusal line fails it —
+  // a model that says it does not know the format wrote the rest by guessing.
+  let refused: string[] = [];
+  if (opts.synthetic) {
+    const split = splitNonEvents(list);
+    if (split.refusals.length && split.events.length) refused = split.refusals;
+    list = split.events.length ? split.events : list;
+  }
   const base: SampleVerification = {
     verdict: 'unverified', method: 'none', eventsParsed: 0,
     eventsChecked: 0, fields: [], reasons: [], offendingEvents: [], keyEcho: null,
   };
   if (list.length === 0) {
     return { ...base, verdict: 'fail', reasons: ['no events'] };
+  }
+
+  // Refusal text / bare-value lines are not events of ANY source — no format
+  // check can rescue them, real or synthetic.
+  const usability = assessSampleUsable(list);
+  if (!usability.usable) {
+    return { ...base, verdict: 'fail', method: 'structure', eventsChecked: Math.min(list.length, MAX_EVENTS_CHECKED),
+      reasons: [usability.reason], offendingEvents: list.slice(0, 3).map(e => e.slice(0, 300)) };
+  }
+  if (refused.length) {
+    return { ...base, verdict: 'fail', method: 'structure', eventsChecked: Math.min(list.length, MAX_EVENTS_CHECKED),
+      reasons: [`The generator said it does not know this source's format (${refused.length} of ${refused.length + list.length} lines, e.g. "${refused[0].slice(0, 100)}"), so the other events are guesses. Provide real events for this source.`],
+      offendingEvents: refused.slice(0, 3).map(e => e.slice(0, 300)) };
   }
 
   const checked = list.slice(0, MAX_EVENTS_CHECKED);
@@ -1277,6 +1342,38 @@ export function eventsToLines(events: unknown[] | null | undefined): string[] {
   return (Array.isArray(events) ? events : []).map(eventToLine).filter(Boolean);
 }
 
+// Flatten reference/sample events into ONE EVENT PER LINE. Reference samples
+// (and some AI output) arrive as pretty-printed multi-line JSON or XML; the
+// sampleEvents string is newline-delimited and Cribl re-breaks it on '\n', so a
+// multi-line event shreds into per-line fragments (aws_cloudtrail: 20 records
+// → 721 fragments → parser sees _raw='{' → score 4). Compact each event to a
+// single line: JSON → JSON.stringify(parse); XML/text → collapse internal
+// newlines. Events already single-line pass through untouched. Shared by the
+// batch, the wizard and `npm run batch:probe`, so every path builds from the
+// same lines.
+export function flattenEventsToLines(events: unknown[]): string {
+  const lines: string[] = [];
+  for (const e of events) {
+    // ONE rule for event-object -> line, shared with api.ts (eventToLine above):
+    // an event carrying a `_raw` string IS that string, never its envelope.
+    let trimmed = eventToLine(e);
+    if (!trimmed) continue;
+    // Strip outer quotes that some sources wrap around the entire _raw line
+    // (Zscaler NSS KV format, some syslog forwarders). Without this, format
+    // detection sees a leading `"` and misclassifies the content.
+    if (trimmed.length > 2 && trimmed[0] === '"' && trimmed[trimmed.length - 1] === '"' && !trimmed.startsWith('{"')) {
+      trimmed = trimmed.slice(1, -1);
+    }
+    if (trimmed.indexOf('\n') === -1) { lines.push(trimmed); continue; }
+    // Multi-line: try compact JSON, else collapse whitespace runs.
+    if (/^[{[]/.test(trimmed)) {
+      try { lines.push(JSON.stringify(JSON.parse(trimmed))); continue; } catch { /* not valid JSON */ }
+    }
+    lines.push(trimmed.replace(/\n\s*/g, ' '));
+  }
+  return lines.join('\n');
+}
+
 /** Events a build asks the model for when it has no stored sample at all.
  *
  * Was 50. Generation cost scales with the ask and 50 events put a plain request
@@ -1357,219 +1454,17 @@ export function sampleShapeUniverse(realEvents: string[]): SampleShapeUniverse {
   };
 }
 
-// --- Wire-format description (what the USER needs to see before choosing) -----
-//
-// Several sources emit their events in more than one wire format depending on how
-// the feed was configured (Zscaler NSS: key=value / JSON / CEF; FortiGate: kvp or
-// CEF; Corelight: JSON or TSV — `MULTI_FORMAT_SOURCES` in pack-builder.ts). The
-// pack is built around the format of the sample it was given, so picking a sample
-// blind means silently picking a format: a CEF sample for a feed that really emits
-// key=value produces a pipeline that extracts nothing from production data. Every
-// place the app OFFERS a sample therefore labels its format, using this one
-// describer so the label cannot disagree between run modes or between screens.
-//
-// `sampleFingerprint`'s envelope is deliberately coarse (json / kvp / cef /
-// unstructured) because that is all the replay guard needs. A human choosing
-// between two samples needs the finer distinctions — LEEF is not CEF, TSV is not
-// CSV, and XML is not "unstructured text" — so this adds them.
-
-export type SampleFormatId =
-  | 'empty' | 'json' | 'xml' | 'cef' | 'leef' | 'kvp' | 'csv' | 'tsv' | 'psv' | 'syslog' | 'text';
-
-export interface SampleFormatDescription {
-  id: SampleFormatId;
-  /** Short badge text, e.g. `CEF`, `Key=value`, `TSV (14 cols)`. */
-  label: string;
-  /** One sentence for a tooltip / advice line. */
-  detail: string;
-  /** Lines that were inspected. */
-  lines: number;
-  /** Share of inspected lines matching `id` (1 = every line agrees). */
-  agreement: number;
-  /** True when the sample carries more than one shape — worth telling the user. */
-  mixed: boolean;
-  delimiter?: string;
-  columns?: number;
-}
-
-const FORMAT_DETAIL: Record<SampleFormatId, string> = {
-  empty: 'No events to inspect.',
-  json: 'One JSON object per line — fields are named, so extraction is a json serde.',
-  xml: 'XML events — extraction needs XML parsing and event breaking on the element boundary, not newlines.',
-  cef: 'ArcSight CEF — a pipe-delimited header plus key=value extension fields.',
-  leef: 'IBM LEEF — a pipe-delimited header plus tab-delimited attributes.',
-  kvp: 'Space-separated key=value pairs — extraction is a kvp serde.',
-  csv: 'Comma-separated columns with no field names — the column order IS the schema.',
-  tsv: 'Tab-separated columns with no field names — the column order IS the schema.',
-  psv: 'Pipe-separated columns with no field names — the column order IS the schema.',
-  syslog: 'Syslog-style free text — extraction needs regex patterns per message type.',
-  text: 'Free text with no delimiters or field names — extraction needs regex patterns.',
-};
-
-/**
- * Syslog framing at the head of a line: optional octet count, optional `<pri>`
- * with optional RFC5424 version digit, then a BSD (`Apr 17 [2020 ]14:08:08` —
- * Cisco ASA emits the 4-token form) or ISO-8601 timestamp.
- */
-const SYSLOG_HEAD =
-  /^(?:\d{2,6}\s+)?(?:<\d{1,3}>\s*\d?\s*)?(?:[A-Z][a-z]{2}\s+\d{1,2}\s+(?:\d{4}\s+)?\d\d:\d\d:\d\d|\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d)/;
-
-/** A JSON object carried inside another envelope (syslog-framed Corelight/Zeek, …). */
-function embeddedJson(line: string): boolean {
-  const start = line.indexOf('{');
-  const end = line.lastIndexOf('}');
-  if (start < 1 || end < start) return false;
-  const body = line.slice(start, end + 1);
-  // Only call it JSON when the object IS the event, not a brace in a message.
-  if (body.length < line.length * 0.6) return false;
-  try {
-    const parsed: unknown = JSON.parse(body);
-    return !!parsed && typeof parsed === 'object' && Object.keys(parsed as object).length >= 3;
-  } catch { return false; }
-}
-
-/** Classify ONE line. Order matters: the specific envelopes must win over kvp. */
-function classifyLine(line: string): { id: SampleFormatId; wrapped?: boolean } {
-  const l = line.trim();
-  if (!l) return { id: 'empty' };
-  if (/(?:^|\s)LEEF:\s*\d(?:\.\d)?\|/.test(l)) return { id: 'leef' };
-  if (/(?:^|\s)CEF:\s*\d+\|/.test(l)) return { id: 'cef' };
-  if (/^[[{]/.test(l)) {
-    try { JSON.parse(l); return { id: 'json' }; } catch { /* not valid JSON — keep looking */ }
-  }
-  // `<166>Jan 12 …` is syslog priority, NOT xml — check for a real element name.
-  if (/^<\?xml/i.test(l) || (/^<[A-Za-z_]/.test(l) && /(?:<\/[A-Za-z_][\w:.-]*>|\/>)/.test(l))) return { id: 'xml' };
-  if (embeddedJson(l)) return { id: 'json', wrapped: true };
-  // `|` and `;` count as pair separators: Check Point log-exporter writes
-  // `time=…|hostname=…|product=…`, which is key=value, not pipe-separated columns.
-  // The value stops at a pair separator too: `time=…|hostname=…` is two pairs, and a
-  // value matched as `\S+` would swallow the whole (space-free) line as one pair.
-  const kvHits = (l.match(/(?:^|[\s,;|{[])[A-Za-z_][\w.-]*\s*=\s*(?:"[^"]*"|[^\s|;]*)/g) || []).length;
-  if (kvHits >= 3) return { id: 'kvp' };
-  if (SYSLOG_HEAD.test(l)) return { id: 'syslog' };
-  if (kvHits >= 1) return { id: 'kvp' };
-  return { id: 'text' };
-}
-
-/**
- * Describe the wire format of a sample so it can be shown BEFORE it is used.
- *
- * Deterministic and offline — no AI, no network — because it labels a list of
- * samples in the UI and has to be instant. Inspects at most `limit` lines and
- * reports the dominant shape plus whether the lines disagree.
- */
-export function describeSampleFormat(events: string[] | string, limit = 50): SampleFormatDescription {
-  const lines = (Array.isArray(events) ? events : String(events || '').split('\n'))
-    .map(l => (l || '').trim()).filter(Boolean).slice(0, limit);
-  if (lines.length === 0) {
-    return { id: 'empty', label: 'No events', detail: FORMAT_DETAIL.empty, lines: 0, agreement: 0, mixed: false };
-  }
-  const seen = lines.map(classifyLine);
-  const tally = new Map<SampleFormatId, number>();
-  for (const s of seen) tally.set(s.id, (tally.get(s.id) || 0) + 1);
-  let [id, hits] = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
-  const agreement = hits / lines.length;
-
-  // Columns are a property of the WHOLE sample, never of one line: any long free-text
-  // line splits into "5 columns" on a comma. Only lines that carry no field names can
-  // be columnar, and the column count has to repeat.
-  let delimited: { delimiter: string; columns: number } | null = null;
-  let framed = false;
-  if (id === 'text' || id === 'syslog') {
-    const plain = lines.filter((_, i) => seen[i].id === id && !lines[i].startsWith('#'));
-    delimited = dominantDelimited(plain);
-    if (delimited) {
-      // Columns carried inside a syslog frame (Aruba CX): the frame has to come off
-      // before the columns line up, so say both rather than hiding one. The frame is
-      // there when the first column is not one token — a CSV whose first column is an
-      // ISO timestamp (`2024-01-24T15:31:51.231Z,…`) is NOT framed.
-      const d = delimited.delimiter;
-      framed = id === 'syslog'
-        && plain.filter(l => /\s/.test(l.slice(0, l.indexOf(d)))).length / plain.length >= 0.7;
-      id = delimited.delimiter === '\t' ? 'tsv' : delimited.delimiter === ',' ? 'csv' : 'psv';
-      hits = plain.length;
-    }
-  }
-
-  const wrapped = id === 'json' && seen.some(s => s.id === 'json' && s.wrapped);
-  const label = delimited
-    ? `${id.toUpperCase()} (${delimited.columns} cols${framed ? ', syslog-framed' : ''})`
-    : id === 'kvp' ? 'Key=value'
-    : id === 'syslog' ? 'Syslog text'
-    : id === 'text' ? 'Free text'
-    : wrapped ? 'JSON (syslog-framed)'
-    : id.toUpperCase();
-  return {
-    id, label, lines: lines.length, agreement, mixed: tally.size > 1,
-    detail: FORMAT_DETAIL[id]
-      + (wrapped ? ' Each event is a JSON object inside a syslog frame — the frame has to be stripped first.' : '')
-      + (framed ? ' The columns sit inside a syslog frame, which has to be stripped before they line up.' : '')
-      + (tally.size > 1
-        ? ` ${hits} of ${lines.length} inspected lines look like this; the sample mixes ${tally.size} shapes.`
-        : ''),
-    ...(delimited ? { delimiter: delimited.delimiter, columns: delimited.columns } : {}),
-  };
-}
-
-/** The column count if ≥70% of `lines` split into the same number of fields. */
-function dominantDelimited(lines: string[]): { delimiter: string; columns: number } | null {
-  if (lines.length === 0) return null;
-  for (const delimiter of ['\t', ',', '|']) {
-    const tally = new Map<number, number>();
-    for (const l of lines) {
-      const c = l.split(delimiter).length;
-      if (c >= EXTEND_MIN_COLUMNS) tally.set(c, (tally.get(c) || 0) + 1);
-    }
-    const best = [...tally.entries()].sort((a, b) => b[1] - a[1])[0];
-    if (best && best[1] / lines.length >= 0.7) return { delimiter, columns: best[0] };
-  }
-  return null;
-}
-
-/**
- * Does a described sample match one option of a `MultiFormatSpec`? Used to tell the
- * user "this sample is the CEF variant" and to warn when it is not the variant they
- * picked. Option ids come from `MULTI_FORMAT_SOURCES` in pack-builder.ts.
- */
-export function sampleFormatMatchesVariant(desc: SampleFormatDescription, optionId: string): boolean {
-  switch ((optionId || '').toLowerCase()) {
-    case 'json': return desc.id === 'json';
-    case 'cef': return desc.id === 'cef';
-    case 'leef': return desc.id === 'leef';
-    case 'kv': case 'kvp': return desc.id === 'kvp';
-    case 'tsv': return desc.id === 'tsv';
-    case 'csv': return desc.id === 'csv';
-    // W3C ELF and SQUID are both space-separated free text to the classifier.
-    case 'elf': case 'squid': return desc.id === 'text' || desc.id === 'syslog';
-    default: return false;
-  }
-}
-
-/**
- * Which of a source's variants are actually PRESENT in a sample, line by line.
- *
- * A dominant-shape label is not enough for a source that ships in several formats:
- * the Corelight reference sample really does carry syslog-framed JSON records AND
- * Zeek TSV rows, so building "the JSON variant" from it silently drops 40% of the
- * events. Returns the option ids that at least `minShare` of the lines match.
- */
-export function sampleVariantsPresent(
-  events: string[] | string,
-  optionIds: string[],
-  { limit = 50, minShare = 0.1 } = {},
-): string[] {
-  const lines = (Array.isArray(events) ? events : String(events || '').split('\n'))
-    .map(l => (l || '').trim()).filter(Boolean).slice(0, limit);
-  if (lines.length === 0) return [];
-  const hits = new Map<string, number>();
-  for (const line of lines) {
-    const desc = describeSampleFormat([line]);
-    for (const id of optionIds) {
-      if (sampleFormatMatchesVariant(desc, id)) hits.set(id, (hits.get(id) || 0) + 1);
-    }
-  }
-  return optionIds.filter(id => (hits.get(id) || 0) / lines.length >= minShare);
-}
+// --- Wire-format description ---------------------------------------------------
+// Moved to the dependency-free `sample-format.ts` so detection, parser routing and
+// the golden store can share it without importing this module; re-exported here so
+// every existing importer (App, panels, tests, scripts) is unchanged.
+export {
+  describeSampleFormat, sampleFormatMatchesVariant, sampleVariantsPresent,
+  sampleWireFormat, wireFormatOf, sampleSecurityHeader, parseSecurityHeader,
+} from './sample-format';
+export type {
+  SampleFormatId, SampleFormatDescription, SourceWireFormat, SecurityHeader, SampleSecurityHeader,
+} from './sample-format';
 
 export interface ExtensionGuardResult {
   /** Synthetic lines that may be used, in the order given. */
