@@ -52,6 +52,27 @@ export function isDevIframe(): boolean {
   }
 }
 
+/**
+ * Inside Cribl the app uses the org's own AI Settings (Settings → AI Settings, BYOM
+ * or Cribl-managed) and its AI settings are read-only. Only a localhost session —
+ * the standalone dev server, or the app running in a localhost Cribl — may choose
+ * another provider or model.
+ */
+export function aiSettingsLocked(): boolean {
+  return getRunMode() === 'iframe' && !isDevIframe();
+}
+
+/** The org's AI Settings choose the model; this id only labels the choice. */
+export const CRIBL_AI_SETTINGS_MODEL = 'cribl-ai-settings';
+
+/** A locked install always reports the org's AI Settings, whatever was saved before. */
+function applyAiLock(s: AiSettings): AiSettings {
+  if (!aiSettingsLocked()) return s;
+  const m = CRIBL_AI_SETTINGS_MODEL;
+  if (s.provider === 'cribl' && s.model === m && s.normalModel === m && s.repairModel === m) return s;
+  return { ...s, provider: 'cribl', model: m, normalModel: m, repairModel: m };
+}
+
 function getDefaultSettings(): AiSettings {
   // iframe defaults to Anthropic (platform proxy injects its key); standalone
   // and Backend Functions default to Aperture.
@@ -63,7 +84,7 @@ function getDefaultSettings(): AiSettings {
     normalModel: model,
     repairModel: model,
     bedrockRegion: 'us-east-1',
-    devProxyUrl: 'http://ai/bedrock',
+    devProxyUrl: 'http://ai-gateway.example/bedrock',
   };
 }
 
@@ -385,6 +406,10 @@ export function setSettingsKvTransportForTests(f: SettingsFetch, base: string): 
 export const platformSettingsFlushed = (): Promise<void> => platformWrites;
 
 export function loadSettings(): AiSettings {
+  return applyAiLock(loadStoredSettings());
+}
+
+function loadStoredSettings(): AiSettings {
   if (memorySettings) return memorySettings;
   // Try localStorage first
   if (canUseLocalStorage()) {
@@ -423,6 +448,10 @@ export function loadSettings(): AiSettings {
 
 // Async version that waits for platform settings to load (use at app startup)
 export async function loadSettingsAsync(): Promise<AiSettings> {
+  return applyAiLock(await loadStoredSettingsAsync());
+}
+
+async function loadStoredSettingsAsync(): Promise<AiSettings> {
   if (memorySettings) return memorySettings;
   if (canUseLocalStorage()) {
     try {
@@ -536,7 +565,7 @@ async function persistAiCredentials(s: AiSettings): Promise<void> {
 
 export async function saveSettings(s: AiSettings): Promise<void> {
   const previous = loadSettings();
-  const live = { ...previous, ...s };
+  const live = applyAiLock({ ...previous, ...s });
   await persistAiCredentials(live);
 
   const confirmed = { ...live };

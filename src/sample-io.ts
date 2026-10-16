@@ -170,7 +170,7 @@ export function shouldUseBackendProxy(
   if (mode === 'backend') return false;
   // STANDALONE ALWAYS uses the backend. This is the single architectural rule:
   //   • standalone → all Cribl API calls go through the .mjs handlers, and all
-  //     AI goes through Tailscale/Aperture (the backend reaches http://ai/bedrock;
+  //     AI goes through Tailscale/Aperture (the backend reaches http://ai-gateway.example/bedrock;
   //     the browser cannot resolve that host). NEVER client-side.
   //   • iframe → never backend: AI runs client-side via the configured provider,
   //     Cribl via criblFetch (platform injects auth).
