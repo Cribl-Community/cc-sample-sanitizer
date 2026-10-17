@@ -4,7 +4,11 @@ Turn a real log sample into a shareable, de-identified sample — **entirely on-
 
 Sharing production log samples is how teams reproduce parsing problems, build pipelines, and file support cases. But raw samples carry hostnames, IPs, usernames, emails, tokens, and other identifiers you can't paste into a ticket, a Slack channel, or a vendor thread. Sample Sanitizer removes that friction: point it at a real sample, review what it found, sanitise, and share the result with confidence.
 
-## What it does
+## When to use this app
+
+Use it before you share a production log sample outside its source: in a support case, a vendor thread, a Slack channel, or as test data for a pipeline or pack. It keeps the sample's structure, so a parser built against the sanitised sample still works on the real data.
+
+## How to use
 
 1. **Bring a sample** — upload a file, paste text, pull live events from a Cribl worker group, or search existing worker-group samples (including samples inside installed packs) by name.
 2. **Review detected identifiers** — the app highlights the values it will replace (IPs, hostnames, emails, usernames, tokens, and similar), so you see exactly what changes before anything is rewritten.
@@ -17,7 +21,7 @@ Sharing production log samples is how teams reproduce parsing problems, build pi
 - **No external hosts.** The app ships **no proxies** and makes no outbound calls. The only network it touches is your own Cribl leader's API, over the platform's authenticated session.
 - **Least-privilege RBAC.** The bundled policy grants only what the app needs: read worker groups/workers, capture events, read/write the sanitised-sample library, and **read-only** discovery of samples inside installed packs (so you can pick one to sanitise). It never writes to packs.
 
-## Requirements
+## Before you install
 
 - A Cribl Cloud org with the App Platform (Preview) enabled.
 - Access to at least one worker group if you want to pull live events or save to the shared library (uploading/pasting a sample works without one).
@@ -27,11 +31,32 @@ Sharing production log samples is how teams reproduce parsing problems, build pi
 
 Sanitisation is best-effort de-identification driven by pattern detection. Always review the highlighted identifiers — and the sanitised output — before sharing externally. The app is built from the same sanitise engine as the Cribl Pack Generator.
 
-## Installing
+## Installation
 
 Install from the **Cribl Apps Marketplace** (**Apps → View All → Add App**). You can also upload the packaged `.tgz` from a release directly in **Cribl → Apps**.
 
 After install, an admin must grant open access (**Apps → Sample Sanitizer → Settings → Members & Teams**); App Platform gates who may *open* an installed app separately from `policies.yml`. No configuration is required — open the app and select a sample.
+
+## Configuration
+
+None. The app has no settings, keys or external services to set up. Which worker groups you can capture from or save to follows your Cribl role.
+
+## Permissions and external access
+
+The app asks Cribl for these API permissions (`default/policies.yml`):
+
+- **Worker groups and workers**: read, for the group picker and to hide groups with no connected worker.
+- **Capture** (`/m/*/system/capture`): to pull live events from a worker group.
+- **Samples** (`/m/*/system/samples`): read and write the shared sanitised-sample library. Delete (`/m/*/system/samples/*`) removes a library entry when you delete it in the app.
+- **Packs and pack samples**: read only, to find samples inside installed packs.
+
+External hosts: none. The app declares no proxies.
+
+## Data and storage
+
+- Your sample is processed in the browser. The raw sample is not stored by the app.
+- Sanitised samples you save go to the worker group's sample library, where anyone with access to that group can read them, and are also recorded in the app's own KV store. Downloads go to your machine. Only sanitised output is saved.
+- Nothing is sent outside your Cribl org.
 
 ## Contributing
 
@@ -39,7 +64,13 @@ Issues and pull requests are welcome in this repository. It is generated from th
 
 ## Support
 
-Built and maintained by Wilfred van der Linde (Cribl SE). For issues, open one in this repository.
+Open an issue in [this repository](https://github.com/Cribl-Community/cc-sample-sanitizer/issues). It is maintained by Wilfred van der Linde (Cribl Solutions Engineering), who aims to fix critical security issues within 10 days and high ones within 4 weeks.
+
+## Known limitations and troubleshooting
+
+- Detection is pattern based. An identifier in a format the rules don't know can survive, so always review the output before you share it.
+- Live capture needs a worker group with at least one connected worker; groups without one are hidden.
+- Saving to the library needs write access to the worker group's samples in your Cribl role.
 
 ## License
 

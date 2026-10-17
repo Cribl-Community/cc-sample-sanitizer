@@ -7,6 +7,7 @@
 // provably AI-free only while this file does (see CLAUDE.md Hard Rule 25,
 // enforced by tests/sanitizer-ai-free-test.mjs).
 import { getRunMode } from './run-mode';
+import { INTERNAL_AI } from './build-flavor';
 
 // 'cribl' = the org's own Cribl AI Settings (BYOM or Cribl-managed), reached through
 // the platform's open_investigator agent. App (iframe) mode only; no key of our own.
@@ -76,7 +77,7 @@ function applyAiLock(s: AiSettings): AiSettings {
 function getDefaultSettings(): AiSettings {
   // iframe defaults to Anthropic (platform proxy injects its key); standalone
   // and Backend Functions default to Aperture.
-  const provider = getRunMode() === 'iframe' ? 'anthropic' : 'devproxy';
+  const provider = getRunMode() === 'iframe' || !INTERNAL_AI ? 'anthropic' : 'devproxy';
   const model = provider === 'anthropic' ? 'claude-sonnet-5' : 'us.anthropic.claude-sonnet-5';
   return {
     provider,

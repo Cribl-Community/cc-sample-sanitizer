@@ -42,6 +42,11 @@ jobs:
             git tag -f "${GITHUB_REF_NAME}"
             git push origin "${GITHUB_REF_NAME}" --force
           fi
+          # Keep the release commit on a branch too. Cribl upgrades a Git-installed
+          # app with a plain fetch, which brings in branches (and the tags that point
+          # into them) only, so a commit reachable from the tag alone fails with
+          # "reference is not a tree".
+          git push origin "HEAD:refs/heads/release" --force
           git tag -f latest "${GITHUB_REF_NAME}"
           git push origin latest --force
 
