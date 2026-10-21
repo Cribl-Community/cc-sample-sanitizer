@@ -31,7 +31,7 @@ import {
   type LocalSampleRecognition,
 } from './sanitised-sample-workflow';
 import { canonicalizeSourcetype, getSupportedSourcetypeCatalog } from './source-recognition';
-import { buildSanitiseChoices, canRefineSelection, countShapeMatches, describeRegexDraft, describeSelection, encodePatternExtra, markedValueShapeMulti, patternPatchDisplay, PICKED_PATTERN_VIA, rebuildPatternAlias, previewSanitisation, regexFromSelection, splitExtras, splitStructuredToken, structuralOffenders, structureBannerText, applySanitisation, checkStructurePreserved, type PartContextMode, type PartMatchMode, type SanitiseEntry, type SanitisePlan, type SelectionCandidate } from './sample-sanitise';
+import { buildSanitiseChoices, canRefineSelection, countShapeMatches, describeRegexDraft, describeSelection, encodePatternExtra, markedValueShapeMulti, patternPatchDisplay, PICKED_PATTERN_VIA, rebuildPatternAlias, previewSanitisation, regexFromSelection, splitExtras, splitStructuredToken, structuralOffenders, structureBannerText, offendingEntries, applySanitisation, checkStructurePreserved, type PartContextMode, type PartMatchMode, type SanitiseEntry, type SanitisePlan, type SelectionCandidate } from './sample-sanitise';
 import { ensureSecretRules, secretRulesNotice, secretRulesStatus, type SecretRulesStatus } from './secret-rules';
 import { groupEntries, SANITISE_ROW_CAP } from './sanitise-groups';
 
@@ -994,7 +994,7 @@ export function SanitizeWizard({
 
   // The structure gate's banner: what broke, in plain words, and how many entries are marked.
   function blockOnStructure(problems: string[]) {
-    showStructureBanner(structureBannerText(problems, structuralOffenders(plan?.entries || [], raw).size));
+    showStructureBanner(structureBannerText(problems, offendingEntries(plan?.entries || [], raw)));
     setStructureBlock(true);
     requestAnimationFrame(() => alertRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }));
   }
@@ -1011,7 +1011,7 @@ export function SanitizeWizard({
     const entries = plan?.entries || [];
     const check = checkStructurePreserved(raw, applySanitisation(raw, entries));
     if (check.ok) { setStructureBlock(false); setError(''); return; }
-    showStructureBanner(structureBannerText(check.problems, structuralOffenders(entries, raw).size));
+    showStructureBanner(structureBannerText(check.problems, offendingEntries(entries, raw)));
   }, [plan, raw, structureBlock]);
 
   // Any other message replacing the banner ends the live re-check, so it cannot overwrite it.

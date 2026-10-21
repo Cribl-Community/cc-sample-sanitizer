@@ -25,6 +25,8 @@ import {
 import {
   applySanitisation,
   checkStructurePreserved,
+  describeOffenders,
+  offendingEntries,
   planSanitisation,
   proveIdentityCoverage,
   summariseSanitisation,
@@ -431,7 +433,10 @@ export function applyAndVerifySanitisation(
   const run = runSanitisation(before, sourcetype, entries, { verify: true });
   if (!run.liveEntries) throw new SanitisationBlocked('No enabled replacement changes this sample.');
   if (!run.changed) throw new SanitisationBlocked('The enabled replacements did not change this sample.');
-  if (!run.structure.ok) throw new SanitisationBlocked(`Sanitisation changed the wire format: ${run.structure.problems.join(' ')}`);
+  if (!run.structure.ok) {
+    const cause = describeOffenders(offendingEntries(entries, before));
+    throw new SanitisationBlocked(`Sanitisation changed the wire format: ${run.structure.problems.join(' ')}${cause ? ` ${cause} Untick or edit that replacement and apply again.` : ''}`);
+  }
   if (!run.coverage.ok || run.coverage.blind) {
     if (run.coverage.blind) {
       throw new SanitisationBlocked('The parser could not prove that identifying field values changed; this sample cannot be stored safely.');

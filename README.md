@@ -79,6 +79,10 @@ Licensed under Apache-2.0 — see `LICENSE`.
 ## Release notes
 
 - **1.0.x (current)** — the sanitiser's stable feature set, published from the Cribl Pack Generator monorepo.
+  - **Structure errors say where and why.** When sanitising would change the sample's
+    structure, the message now names the first line it happens on, what changes there
+    (`the field "user.email" would become "user.x"`, or the text before and after), and the
+    replacement that causes it, so you know which one to untick or edit.
   - **JSON field names are never rewritten.** A value that also spells a key — GCP audit's
     `compute.googleapis.com` service name inside the `compute.googleapis.com/root_trigger_id`
     label key, or a user called `admin` next to an `"admin": true` flag — is replaced in values
