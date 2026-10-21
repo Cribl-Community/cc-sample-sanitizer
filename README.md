@@ -79,6 +79,10 @@ Licensed under Apache-2.0 — see `LICENSE`.
 ## Release notes
 
 - **1.0.x (current)** — the sanitiser's stable feature set, published from the Cribl Pack Generator monorepo.
+  - **JSON field names are never rewritten.** A value that also spells a key — GCP audit's
+    `compute.googleapis.com` service name inside the `compute.googleapis.com/root_trigger_id`
+    label key, or a user called `admin` next to an `"admin": true` flag — is replaced in values
+    only, so the sample no longer stops at "JSON line(s) changed their field names".
   - **The wire format can never change.** Every replacement is guaranteed to preserve the
     line's structure — the count of tabs, pipes, commas, `=` and spaces is held constant, so a
     positional or delimited parser still splits the sample into the same fields it did before.
