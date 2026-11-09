@@ -11,6 +11,7 @@ import {
   matchDatatypeParserBySample,
   matchGoldenSourceBySample,
   matchJsonSignature,
+  matchWindowsEventXml,
   recognizeCefSource,
   recognizeSourcetype,
 } from './source-recognition';
@@ -26,12 +27,14 @@ import {
   applySanitisation,
   checkStructurePreserved,
   describeOffenders,
+  findResidualOriginals,
   offendingEntries,
   planSanitisation,
   proveIdentityCoverage,
   summariseSanitisation,
   type CoverageProof,
   type ParsedLine,
+  type ResidualHit,
   type SanitiseEntry,
   type SanitiseOptions,
   type SanitisePlan,
@@ -152,6 +155,19 @@ export function recogniseSampleLocally(events: string): LocalSampleRecognition {
         method: 'signature',
         confidence: 'high',
         reason: `Recognised ${sig.description} by its JSON key signature (${sig.matched.join(', ')}).`,
+        format,
+        offline: true,
+      };
+    }
+    // Windows Event XML names its channel, and the channel names the canonical.
+    const win = matchWindowsEventXml(events);
+    if (win) {
+      return {
+        sourcetype: win.sourcetype,
+        display: win.sourcetype,
+        method: 'signature',
+        confidence: 'high',
+        reason: `Recognised ${win.description} (${Math.round(win.share * 100)}% of the events).`,
         format,
         offline: true,
       };
@@ -342,6 +358,8 @@ export interface AppliedSanitisation {
   structure: StructuralCheck;
   coverage: { total: number; replaced: number; blind: boolean; ok: boolean };
   verification: SampleVerification;
+  /** The same parser check on the ORIGINAL — so a fail can be told apart from one sanitising caused. */
+  verificationBefore?: SampleVerification;
   parserName?: string;
 }
 
@@ -364,6 +382,8 @@ export interface SanitisationRun {
   liveEntries: number;
   structure: StructuralCheck;
   coverage: CoverageProof;
+  /** Enabled originals still present anywhere in `text` (see `findResidualOriginals`). */
+  residual: ResidualHit[];
   verification: SampleVerification | null;
   // Verification of the ORIGINAL, untouched events (only when opts.verify). It exists so a
   // caller can tell whether sanitisation DEGRADED parseability or the raw sample simply never
@@ -404,6 +424,7 @@ export function runSanitisation(
     liveEntries: live.length,
     structure,
     coverage,
+    residual: findResidualOriginals(text, entries),
     verification,
     verificationBefore,
     parserName: afterParsed.parserName || beforeParsed.parserName,
@@ -423,6 +444,19 @@ export class SanitisationBlocked extends Error {
     this.name = 'SanitisationBlocked';
     this.survivors = survivors;
   }
+}
+
+/** The blocker sentence for leftover originals, naming the lines like the coverage blocker does. */
+export function describeResidual(residual: ResidualHit[]): string {
+  const lines = [...new Set(residual.map(r => r.line))];
+  const where = lines.length === 1 ? `line ${lines[0]}` : `lines ${lines.slice(0, 10).join(', ')}${lines.length > 10 ? ', …' : ''}`;
+  const n = residual.length;
+  return `${n} ${n === 1 ? 'value' : 'values'} you chose to replace ${n === 1 ? 'is' : 'are'} still in the sanitised text at ${where}, where the replacement did not reach. Mask ${n === 1 ? 'it' : 'them'} with a pattern below, then apply again.`;
+}
+
+/** Residual hits in the shape the wizard's survivor list renders. */
+export function residualSurvivors(residual: ResidualHit[]): { field: string; value: string; line: number }[] {
+  return residual.map(r => ({ field: r.kind, value: r.value, line: r.line }));
 }
 
 export function applyAndVerifySanitisation(
@@ -449,6 +483,11 @@ export function applyAndVerifySanitisation(
       `${survivors.length} parsed ${survivors.length === 1 ? 'identity' : 'identities'} still ${survivors.length === 1 ? 'shows' : 'show'} through unchanged at ${where} — mask ${survivors.length === 1 ? 'it' : 'them'} below, then apply again.`,
       survivors);
   }
+  // The last word: the parse-based proof above only sees fields a parser names, on the lines it
+  // parsed. Any enabled original still present ANYWHERE in the text blocks the save.
+  if (run.residual.length) {
+    throw new SanitisationBlocked(describeResidual(run.residual), residualSurvivors(run.residual));
+  }
   // verify:true above guarantees a verification result. Block ONLY on a sanitisation-caused
   // regression: the original parsed and the sanitised sample no longer does. A raw sample that
   // already failed the parser (real access logs carry scanner probes / TLS handshakes / `408`
@@ -469,6 +508,7 @@ export function applyAndVerifySanitisation(
       ok: run.coverage.ok,
     },
     verification: run.verification as SampleVerification,
+    verificationBefore: run.verificationBefore ?? undefined,
     parserName: run.parserName,
   };
 }

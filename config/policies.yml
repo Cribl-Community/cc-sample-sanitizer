@@ -19,9 +19,9 @@ policies:
   # Shared sanitised-sample library: list + create.
   - object: '/m/*/system/samples'
     actions: ['GET', 'POST']
-  # Shared sanitised-sample library: read metadata, update-by-id, delete.
+  # Replace an existing sample by id — only after the reviewer confirmed the name clash.
   - object: '/m/*/system/samples/*'
-    actions: ['GET', 'PATCH', 'DELETE']
+    actions: ['PATCH']
   # Fetch a sample's events.
   - object: '/m/*/system/samples/*/content'
     actions: ['GET']

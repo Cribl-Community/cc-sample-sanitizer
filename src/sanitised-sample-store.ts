@@ -55,6 +55,10 @@ export interface SanitisedSampleIndexRow {
 }
 
 export const SANITISED_SAMPLE_MAX_BYTES = 1_000_000;
+/* The largest file the sanitiser will read at all. Detection runs many full-text passes, so a
+   much bigger file froze the tab before it could say anything. Above SANITISED_SAMPLE_MAX_BYTES
+   the result can still be downloaded; storing it (library, worker group) needs a smaller one. */
+export const SANITISE_INPUT_MAX_BYTES = 10_000_000;
 
 function unsafeKeyPart(value: string): boolean {
   return /[/\\]/.test(value) || value.includes('..')
@@ -125,7 +129,7 @@ export function buildSanitisedSampleDoc(args: {
   events: string[];
   verification: Partial<SampleVerification>;
   provenance: SanitisedSampleProvenance;
-}): SanitisedSampleDoc {
+}, opts: { enforceStorageLimit?: boolean } = {}): SanitisedSampleDoc {
   const events = args.events.map(String).filter(line => line.trim());
   if (!events.length) throw new Error('A sanitised sample needs at least one event.');
   const key = sanitisedSampleKey(args.sourcetype, args.format);
@@ -141,7 +145,8 @@ export function buildSanitisedSampleDoc(args: {
     provenance: normaliseProvenance(args.provenance),
     sanitised: true,
   };
-  if (JSON.stringify(doc).length > SANITISED_SAMPLE_MAX_BYTES) {
+  // A download is not stored anywhere, so only the storing callers hold to the limit.
+  if (opts.enforceStorageLimit !== false && JSON.stringify(doc).length > SANITISED_SAMPLE_MAX_BYTES) {
     throw new Error(`Sanitised sample is over the ${Math.round(SANITISED_SAMPLE_MAX_BYTES / 1024)} KB storage limit.`);
   }
   return doc;

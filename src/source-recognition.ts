@@ -602,9 +602,27 @@ export interface CefSourceRecognition {
  * a non-CEF sample is left to the other recognisers. LEEF is not claimed: there
  * is no generic LEEF parser to fall back on.
  */
+/**
+ * The event text of a Cribl-exported JSON line (`{"_raw":"CEF:0|…","_time":…}`), else the
+ * line itself. A worker-group sample or a Search export wraps every event this way, and the
+ * header is then inside `_raw`, not at the start of the line.
+ */
+export function unwrapJsonRaw(line: string): { text: string; wrapped: boolean } {
+  if (!line.startsWith('{') || !line.includes('"_raw"')) return { text: line, wrapped: false };
+  try {
+    const raw = (JSON.parse(line) as { _raw?: unknown })._raw;
+    return typeof raw === 'string' && raw.trim() ? { text: raw.trim(), wrapped: true } : { text: line, wrapped: false };
+  } catch {
+    return { text: line, wrapped: false };
+  }
+}
+
 export function recognizeCefSource(sampleEvents: string): CefSourceRecognition | null {
-  const lines = (sampleEvents || '').split('\n').map(l => stripOuterQuotes(l.trim())).filter(Boolean).slice(0, 40);
+  const unwrapped = (sampleEvents || '').split('\n').map(l => l.trim()).filter(Boolean).slice(0, 40).map(unwrapJsonRaw);
+  const wrapped = unwrapped.some(u => u.wrapped);
+  const lines = unwrapped.map(u => stripOuterQuotes(u.text));
   if (lines.length === 0) return null;
+  const inRaw = wrapped ? ' (each event is CEF inside a JSON `_raw`)' : '';
   const cefLines = lines.filter(l => parseSecurityHeader(l)?.format === 'cef');
   if (cefLines.length < Math.max(1, Math.ceil(lines.length * CEF_SAMPLE_SHARE))) return null;
   const header = sampleSecurityHeader(cefLines);
@@ -618,14 +636,14 @@ export function recognizeCefSource(sampleEvents: string): CefSourceRecognition |
   if (hit && parserWireFormats(hit.sourcetype)?.includes('cef')) {
     return {
       sourcetype: hit.sourcetype, vendor, product, dedicated: true,
-      reason: `Format first: the sample is CEF, and its header names the source (Device Vendor/Product "${named}"). Sourcetype is ${hit.sourcetype}, whose parser reads CEF.`,
+      reason: `Format first: the sample is CEF${inRaw}, and its header names the source (Device Vendor/Product "${named}"). Sourcetype is ${hit.sourcetype}, whose parser reads CEF.`,
     };
   }
   return {
     sourcetype: 'cef', vendor, product, dedicated: false,
     reason: named
-      ? `Format first: the sample is CEF from "${named}" (read from the header). Sourcetype is cef — the generic CEF Key Dictionary parser reads this vendor's header and extension best.`
-      : 'Format first: the sample is CEF, with no single Device Vendor in the header. Sourcetype is cef — the generic CEF Key Dictionary parser.',
+      ? `Format first: the sample is CEF${inRaw} from "${named}" (read from the header). Sourcetype is cef — the generic CEF Key Dictionary parser reads this vendor's header and extension best.`
+      : `Format first: the sample is CEF${inRaw}, with no single Device Vendor in the header. Sourcetype is cef — the generic CEF Key Dictionary parser.`,
   };
 }
 
@@ -2046,6 +2064,15 @@ const JSON_SIGNATURE_SOURCES: JsonSignatureSource[] = [
     required: ['RecordType', 'CreationTime', 'Operation', 'OrganizationId', 'Workload', 'UserKey', 'UserType'],
     description: 'Microsoft 365 Unified Audit Log (Management Activity API) — JSON per record',
   },
+  {
+    // Check Point Log Exporter / management JSON. `loguid` is Check Point's log id and
+    // `originsicname` its SIC certificate name (`CN=…,O=…`): no other vendor sends
+    // the pair. A worker-group sample of "Log Update" events carries little else, so
+    // it went to the AI (3-4 s, Next disabled) for a name read here for free.
+    sourcetype: 'checkpoint_firewall',
+    required: ['loguid', 'originsicname'],
+    description: 'Check Point firewall logs — JSON per record',
+  },
 ];
 
 export interface JsonSignatureMatch {
@@ -2075,6 +2102,59 @@ export function matchJsonSignature(sampleEvents: string): JsonSignatureMatch | n
     if (!best || sig.required.length > best.required.length) best = sig;
   }
   return best ? { sourcetype: best.sourcetype, matched: best.required, description: best.description } : null;
+}
+
+// Windows Event XML: the envelope is the same on every channel, so the format names
+// the family and the `<Channel>` names the canonical (each channel has its own
+// EventData model, data class and parser alias step — see the per-channel aliases).
+const WINDOWS_EVENT_XML = /<Event\s+xmlns=['"]http:\/\/schemas\.microsoft\.com\/win\/2004\/08\/events\/event['"]/;
+const WINDOWS_CHANNEL_SOURCETYPES: Record<string, string> = {
+  'security': 'windows_security',
+  'microsoft-windows-ntlm/operational': 'windows_security',
+  'system': 'windows_system',
+  'application': 'windows_application',
+  'microsoft-windows-sysmon/operational': 'windows_sysmon',
+  'microsoft-windows-powershell/operational': 'windows_powershell',
+  'windows powershell': 'windows_powershell',
+  'microsoft-windows-windows defender/operational': 'windows_defender',
+  'microsoft-windows-dns-client/operational': 'windows_dns_client',
+};
+
+export interface WindowsEventXmlMatch {
+  sourcetype: string;
+  channel: string;
+  /** Share of the Windows XML events on that channel, 0..1. */
+  share: number;
+  description: string;
+}
+
+/**
+ * Name a Windows Event XML sample from its channel, offline. At least 60% of the
+ * events must be Windows Event XML, and one mapped channel must carry at least half of
+ * them; a tie, an unmapped majority channel (Directory Service, …) or a spread with no
+ * majority returns null so the caller falls through to the AI/manual path. The
+ * datatype matcher cannot do this: XML attributes fingerprint as kvp keys that are
+ * identical on every channel.
+ */
+export function matchWindowsEventXml(sampleEvents: string): WindowsEventXmlMatch | null {
+  const text = (sampleEvents || '').trim();
+  if (!WINDOWS_EVENT_XML.test(text)) return null;
+  // Events break on the `<Event` boundary, not on newlines: a pretty-printed event
+  // spans many lines. Anything before the first boundary is one more segment.
+  const events = text.split(/(?=<Event\s)/).map(l => l.trim()).filter(Boolean).slice(0, 200);
+  const xml = events.filter(l => WINDOWS_EVENT_XML.test(l));
+  if (xml.length < Math.ceil(events.length * 0.6)) return null;
+  const counts = new Map<string, number>();
+  for (const l of xml) {
+    const ch = /<Channel>([^<]*)<\/Channel>/.exec(l)?.[1]?.trim();
+    if (ch) counts.set(ch, (counts.get(ch) || 0) + 1);
+  }
+  const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  if (!ranked.length || (ranked[1] && ranked[1][1] === ranked[0][1])) return null;
+  const [channel, n] = ranked[0];
+  const sourcetype = WINDOWS_CHANNEL_SOURCETYPES[channel.toLowerCase()];
+  if (!sourcetype || n < xml.length / 2) return null;
+  return { sourcetype, channel, share: n / xml.length, description: `Windows Event Log XML, ${channel} channel` };
 }
 
 export function matchDatatypeParserBySample(sampleEvents: string): DatatypeSampleMatch | null {
@@ -3184,7 +3264,7 @@ function cefKeyDictionaryFunctions(): PipelineFunction[] {
           { name: 'vendor', value: 'device_vendor || undefined' },
           { name: 'product', value: 'device_product || undefined' },
           { name: 'vendor_product', value: "String(device_vendor || '') + (device_vendor && device_product ? ' ' : '') + String(device_product || '')" },
-          { name: 'host', value: 'device_host || dvchost || shost || undefined' },
+          { name: 'host', value: 'host || device_host || dvchost || shost || undefined' },
           { name: 'user', value: 'suser || duser || undefined' },
           // Severity: CEF allows a 0-10 integer OR the text Unknown/Low/Medium/High/Very-High
           { name: 'severity', value: "/^\\d+$/.test(String(severity_raw)) ? Number(severity_raw) : (String(severity_raw).toLowerCase() == 'very-high' ? 10 : String(severity_raw).toLowerCase() == 'high' ? 8 : String(severity_raw).toLowerCase() == 'medium' ? 5 : String(severity_raw).toLowerCase() == 'low' ? 2 : String(severity_raw).toLowerCase() == 'unknown' ? 0 : undefined)" },
@@ -3198,6 +3278,17 @@ function cefKeyDictionaryFunctions(): PipelineFunction[] {
       },
     },
   ];
+}
+
+/**
+ * A CEF sample never takes the legacy key=value branches. Those branches are
+ * gated on `signature_id` being unset, which the CEF header always sets, so
+ * they sit in the pipeline and never fire. A mixed or non-CEF sample keeps them.
+ */
+export function dropUnreachableCefBranches(fns: PipelineFunction[], sampleEvents: string): PipelineFunction[] {
+  const lines = String(sampleEvents || '').split('\n').map(l => l.trim()).filter(Boolean);
+  if (!lines.length || !lines.every(l => /CEF:\d+\|/.test(l))) return fns;
+  return fns.filter(f => !/typeof\s+signature_id\s*===\s*["']undefined["']/.test(String(f.filter || '')));
 }
 
 export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunctions: boolean): PipelineFunction[] {
@@ -3784,6 +3875,23 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
       return [
         ...cefKeyDictionaryFunctions(),
         {
+          id: 'eval',
+          description: 'Check Point CEF extensions the shared dictionary does not name',
+          // The shared CEF dictionary knows src/dst/dvc, not Check Point's own
+          // origin (the firewall that wrote the log), ifname, or service_id.
+          // Gated on signature_id so the legacy KVP stages below stay unchanged.
+          filter: 'typeof signature_id !== "undefined"',
+          conf: {
+            add: [
+              { name: 'origin_ip', value: 'origin_ip || origin || orig || undefined' },
+              { name: 'direction', value: 'direction || deviceDirection || undefined' },
+              { name: 'src_zone', value: 'src_zone || ifname || undefined' },
+              { name: 'app', value: 'app || service_id || undefined' },
+              { name: 'rule_name', value: 'rule_name || cs2 || undefined' },
+            ],
+          },
+        },
+        {
           id: 'regex_extract',
           description: 'Extract RFC5424 syslog header and Check Point payload',
           filter: 'typeof signature_id === "undefined"',
@@ -3852,7 +3960,7 @@ export function getParserForSourcetype(sourcetypeRaw: string, _allowCodeFunction
               { name: 'dest_port', value: 'dst_port || service || undefined' },
               { name: 'transport', value: 'proto || protocol || undefined' },
               { name: 'action', value: 'action || rule_action || undefined' },
-              { name: 'host', value: 'hostname || syslog_host || undefined' },
+              { name: 'host', value: 'host || hostname || syslog_host || undefined' },
               { name: 'app', value: "'Check Point Firewall'" },
               { name: 'vendor_product', value: "'Check Point Software Firewall'" },
               { name: 'rule_name', value: 'rule_name || undefined' },
@@ -5965,9 +6073,10 @@ export function getParserFieldNames(sourcetypeRaw: string, opts?: { strictDataty
         'app', 'vendor_product', 'severity', 'event_code'];
     case 'checkpoint_firewall':
       return ['log_time', 'host', 'src_ip', 'dest_ip', 'src_port', 'dest_port',
-        'transport', 'action', 'direction', 'src_zone', 'user',
+        'transport', 'action', 'direction', 'deviceDirection', 'src_zone', 'user',
         'rule_name', 'rule_id', 'rule', 'match_id', 'parent_rule', 'event_code', 'severity',
         'device_ip', 'session_id', 'dev_id', 'origin_ip',
+        'ifname', 'service_id', 'cs2', 'cs2Label',
         'bytes', 'bytes_in', 'bytes_out', 'src_translated_ip', 'dest_translated_ip',
         'src_translated_port', 'dest_translated_port',
         'app', 'vendor_product'];

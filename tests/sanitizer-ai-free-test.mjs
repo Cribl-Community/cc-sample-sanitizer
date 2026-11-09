@@ -76,14 +76,29 @@ test('the walk actually reaches the sanitise wizard (guards against a broken wal
   }
 });
 
-test('sanitizer settings do not reach background batch orchestration', () => {
+test('the sanitizer does not bundle the AI settings store or background batch orchestration', () => {
   const { seen } = reachable(ENTRY);
   const names = [...seen].map((f) => relative(SRC, f));
-  assert.ok(names.includes('settings-store.ts'), 'guard must inspect the shared settings store');
-  assert.ok(
-    !names.includes('background-batch.ts'),
-    'settings-store must own the AI snapshot type instead of importing background orchestration',
-  );
+  // sample-io reads its two settings through sample-io-settings.ts (build 1010); importing
+  // settings-store shipped the Pack Generator's AI provider tables in the AI-free Sanitizer.
+  assert.ok(names.includes('sample-io-settings.ts'), 'sample-io should read settings through the injected hook');
+  assert.ok(!names.includes('settings-store.ts'), 'settings-store (AI provider tables, credentials) must stay out of the Sanitizer');
+  assert.ok(!names.includes('background-batch.ts'), 'background batch orchestration must stay out of the Sanitizer');
+});
+
+test('the sanitizer source names no internal AI gateway or lab host', () => {
+  // The Sanitizer publishes its reachable source for review: dev-only names there read as an
+  // AI dependency (or an internal host) that the app does not have.
+  const { seen } = reachable(ENTRY);
+  const hits = [];
+  for (const file of seen) {
+    if (!/\.tsx?$/.test(file)) continue;   // code only: the sample data legitimately has a `tailscale` log source
+    const src = readFileSync(file, 'utf8');
+    for (const word of [/aperture/i, /tailscale/i, /\bselab\b/i, /http:\/\/ai\/bedrock/i]) {
+      if (word.test(src)) hits.push(`${relative(SRC, file)}: ${word}`);
+    }
+  }
+  assert.deepEqual(hits, []);
 });
 
 test('a planted ai-client import in a reached file WOULD be caught (walker is not vacuous)', () => {

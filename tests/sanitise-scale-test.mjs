@@ -17,7 +17,7 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { planSanitisation, applySanitisation, markSanitisation, PICKED_FIELD_VIA, setSecretRules } from '../src/sample-sanitise.ts';
+import { planSanitisation, applySanitisation, markSanitisation, findResidualOriginals, PICKED_FIELD_VIA, setSecretRules } from '../src/sample-sanitise.ts';
 import { filterSecretRules } from '../src/secret-rule-filter.ts';
 import { SANITISE_GROUPS, SANITISE_ROW_CAP, groupOf, groupEntries } from '../src/sanitise-groups.ts';
 
@@ -71,6 +71,25 @@ test('planning and applying scale with the sample rather than with its square', 
   // And an absolute ceiling, since "linear" is no comfort if the constant is a minute.
   assert.ok(large.plan + large.apply < 8000,
     `2,000 events took ${(large.plan + large.apply).toFixed(0)}ms, which blocks the UI`);
+});
+
+test('the residual scan scales with the sample rather than with its square', () => {
+  // The final "is any original left?" check sees every entry, and entries grow with the sample.
+  // One regex per entry was quadratic: a second for 2,000 events on a fast laptop.
+  const time = (n) => {
+    const text = corpus(n);
+    const plan = planSanitisation(text, { seed: 1 });
+    const out = applySanitisation(text, plan.entries);
+    const t0 = performance.now();
+    const hits = findResidualOriginals(out, plan.entries);
+    return { ms: performance.now() - t0, hits };
+  };
+  const small = time(250);
+  const large = time(2000);
+  assert.deepEqual(large.hits, [], 'a fully replaced sample leaves nothing behind');
+  const ratio = large.ms / Math.max(small.ms, 1);
+  assert.ok(ratio < 25, `8× the events took ${ratio.toFixed(1)}× the time (${small.ms.toFixed(0)}ms → ${large.ms.toFixed(0)}ms)`);
+  assert.ok(large.ms < 4000, `the residual scan of 2,000 events took ${large.ms.toFixed(0)}ms`);
 });
 
 test('one combined pass replaces exactly what one pass per entry did', () => {

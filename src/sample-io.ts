@@ -14,12 +14,13 @@
 // pack-orchestrator, etc.) are unchanged, and `api.ts` itself imports the
 // transport primitives back for its own AI-coupled functions.
 //
-// The settings reads below (`loadSettings`/`loadQualitySettings`) come from the
-// AI-free `settings-store.ts`, NOT `ai-client.ts` — that extraction is what let
-// this module be AI-free at all.
+// The two settings reads below come through `sample-io-settings.ts`, which
+// `settings-store.ts` fills in when it loads. Importing the store directly put the
+// Pack Generator's AI settings code into the AI-free Sample Sanitizer's bundle.
 
+import { DEV_BACKEND, devServerFetch, INTERNAL_AI } from './build-flavor';
 import { getRunMode, type RunMode } from './run-mode';
-import { loadSettings, loadQualitySettings } from './settings-store';
+import { sampleIoSettings } from './sample-io-settings';
 import type { SanitisedSampleDoc, SanitisedSampleIndexRow } from './sanitised-sample-store';
 import { parseSanitisedSampleDoc, sanitisedSampleIndexRow } from './sanitised-sample-store';
 import {
@@ -103,6 +104,7 @@ const SLOW_PROXY_TIMEOUT_MS = 300_000;
 // Standalone routes EVERY Cribl call through these handlers (run-mode rule 17),
 // so an un-bounded hang here parks a whole batch row indefinitely.
 export function proxyFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  if (!DEV_BACKEND) return devServerFetch(path, init);
   const slow = SLOW_PROXY_ENDPOINTS.some((e) => path.includes(e));
   return fetchWithDeadline(path, init, slow ? SLOW_PROXY_TIMEOUT_MS : CRIBL_REQUEST_TIMEOUT_MS);
 }
@@ -111,6 +113,16 @@ export function proxyFetch(path: string, init: RequestInit = {}): Promise<Respon
 export function isTransientFetchError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /failed to fetch|networkerror|network request failed|load failed|fetch failed|timed out|econnreset|econnrefused|etimedout|socket hang up|aborted/i.test(msg);
+}
+
+/**
+ * The leader answered, but its Config Helper was down or the connection was
+ * reset mid-request. Distinct from a slow call that hit its own deadline:
+ * these come back immediately, and retrying a 120s timeout would blow the
+ * stage budget. A 500 that names a bad pipeline is not in this set.
+ */
+export function isLeaderUnavailableMessage(message: unknown): boolean {
+  return /socket hang up|ECONNRESET|ECONNREFUSED|Config Helper service is not available/i.test(String(message ?? ''));
 }
 
 /**
@@ -137,7 +149,114 @@ export async function withTransientRetry<T>(
   throw last;
 }
 
+// ---------------------------------------------------------------------------
+// Scoped commits. A group commit used to take EVERY pending change in the worker group — a
+// colleague's half-finished edit, or the system files a Cribl upgrade leaves pending — and the
+// deploy then pushed it to the workers. The app now remembers what was already pending before
+// its first write to a group (the baseline), and commits only what is new since, plus anything
+// inside the packs it wrote. That needs no knowledge of Cribl's on-disk layout beyond a pack's
+// files carrying its id as a path segment.
+// ---------------------------------------------------------------------------
+
+/** Every changed path in a `/version/status` answer. */
+export function pendingFiles(status: unknown): string[] {
+  const item = (status as { items?: unknown[] } | null)?.items?.[0];
+  if (!item || typeof item !== 'object') return [];
+  const out = new Set<string>();
+  for (const value of Object.values(item as Record<string, unknown>)) {
+    if (Array.isArray(value)) for (const f of value) if (typeof f === 'string') out.add(f);
+  }
+  return [...out];
+}
+
+/**
+ * The pending files a scoped commit takes: what is new since the baseline, plus anything inside
+ * one of `packIds`. Without a baseline (the writes happened in another process, e.g. an earlier
+ * background tick) only the packs' own files.
+ */
+export function scopedCommitFiles(pending: string[], o: { baseline: Set<string> | null; packIds: Iterable<string> }): string[] {
+  const packs = [...o.packIds].filter(Boolean);
+  const inPack = (f: string) => packs.some(id => f.split('/').includes(id));
+  return pending.filter(f => inPack(f) || (o.baseline !== null && !o.baseline.has(f)));
+}
+
+const configBaselines = new Map<string, Promise<Set<string> | null>>();
+const touchedPacks = new Map<string, Set<string>>();
+
+async function fetchPending(group: string): Promise<string[]> {
+  return pendingFiles(await criblFetch(`/version/status?group=${encodeURIComponent(group)}`));
+}
+
+/**
+ * Called before the first config write to `group` since its last commit: records what was
+ * already pending there, and that `packId` is ours. Writes through criblFetch call it on their
+ * own; a caller that writes another way (the raw .crbl upload) calls it first.
+ */
+export async function noteConfigWrite(group: string, packId?: string): Promise<void> {
+  if (!group) return;
+  if (packId) {
+    if (!touchedPacks.has(group)) touchedPacks.set(group, new Set());
+    touchedPacks.get(group)!.add(packId);
+  }
+  if (!configBaselines.has(group)) configBaselines.set(group, fetchPending(group).then(f => new Set(f), () => null));
+  await configBaselines.get(group);
+}
+
+/**
+ * The files to pass to `/version/commit` for `group`, then forgets the group's baseline. Null
+ * when the current status cannot be read: the caller then commits as before rather than not at
+ * all, and says so.
+ */
+export async function filesForScopedCommit(group: string, packIds: Iterable<string> = []): Promise<string[] | null> {
+  const baseline = configBaselines.has(group) ? await configBaselines.get(group)! : null;
+  const packs = new Set([...(touchedPacks.get(group) || []), ...packIds]);
+  configBaselines.delete(group);
+  touchedPacks.delete(group);
+  let pending: string[];
+  try { pending = await fetchPending(group); } catch { return null; }
+  const files = scopedCommitFiles(pending, { baseline, packIds: packs });
+  lastLeftPending = pending.length - files.length;
+  return files;
+}
+
+/** How many pending changes the last scoped commit deliberately left for someone else to commit. */
+let lastLeftPending = 0;
+export function leftPendingByLastCommit(): number {
+  return lastLeftPending;
+}
+
+const CONFIG_WRITE = /^\/m\/([^/?]+)\/(?:p\/([^/?]+)\/|packs\/([^/?]+))?/;
+
+const LEADER_UNAVAILABLE_FETCH_ATTEMPTS = 3;
+const LEADER_UNAVAILABLE_FETCH_DELAY_MS = 1500;
+
 export async function criblFetch<T = unknown>(path: string, opts: RequestInit = {}): Promise<T> {
+  // Only GET is retried here. A POST that died with "socket hang up" may have
+  // landed on the leader; repeating it inside this call can install the pack
+  // twice. The background row asks the whole stage again, and that path checks
+  // whether the pack is already there before it installs.
+  const method = String(opts.method || 'GET').toUpperCase();
+  let last: unknown;
+  for (let attempt = 0; attempt < LEADER_UNAVAILABLE_FETCH_ATTEMPTS; attempt++) {
+    try {
+      return await criblFetchOnce<T>(path, opts);
+    } catch (err) {
+      last = err;
+      const message = err instanceof Error ? err.message : String(err);
+      if (method !== 'GET' || !isLeaderUnavailableMessage(message) || attempt === LEADER_UNAVAILABLE_FETCH_ATTEMPTS - 1) throw err;
+      await new Promise(resolve => setTimeout(resolve, LEADER_UNAVAILABLE_FETCH_DELAY_MS * (attempt + 1)));
+    }
+  }
+  throw last;
+}
+
+async function criblFetchOnce<T = unknown>(path: string, opts: RequestInit = {}): Promise<T> {
+  const method = String(opts.method || 'GET').toUpperCase();
+  if (method !== 'GET' && !path.startsWith('http')) {
+    const m = path.match(CONFIG_WRITE);
+    // A preview runs a pipeline but changes no config; it must not take a baseline either.
+    if (m && !/\/preview(?:\?|$)/.test(path)) await noteConfigWrite(m[1], m[2] || m[3]);
+  }
   const url = path.startsWith('http') ? path : `${getApiBase()}${path}`;
   const resp = await fetchWithDeadline(url, {
     ...opts,
@@ -150,10 +269,9 @@ export async function criblFetch<T = unknown>(path: string, opts: RequestInit = 
     const text = await resp.text();
     let msg: string;
     try { msg = JSON.parse(text).message || text; } catch { msg = text; }
-    // Name the request. An upstream sentence on its own ("Group seLab not
+    // Name the request. An upstream sentence on its own ("Group lab01 not
     // found") cannot be acted on when the caller made three calls — and a
     // background tick reports it to a manifest nobody can cross-reference.
-    const method = String(opts.method || 'GET').toUpperCase();
     throw new Error(`${method} ${path} failed (${resp.status}): ${msg || resp.statusText}`);
   }
   const ct = resp.headers.get('content-type') || '';
@@ -163,15 +281,17 @@ export async function criblFetch<T = unknown>(path: string, opts: RequestInit = 
 
 export function shouldUseBackendProxy(
   mode: RunMode = getRunMode(),
-  provider: string = loadSettings().provider,
+  provider: string = sampleIoSettings().provider(),
 ): boolean {
   // A deployed Backend Function has no local Vite middleware. Its Cribl calls
   // go directly to /api/v1 and its external AI calls use declared proxy hosts.
   if (mode === 'backend') return false;
+  // A build without the development server has nothing to route to (`DEV_BACKEND`).
+  if (!DEV_BACKEND) return false;
   // STANDALONE ALWAYS uses the backend. This is the single architectural rule:
   //   • standalone → all Cribl API calls go through the .mjs handlers, and all
-  //     AI goes through Tailscale/Aperture (the backend reaches http://ai-gateway.example/bedrock;
-  //     the browser cannot resolve that host). NEVER client-side.
+  //     AI goes through the development server's gateway (a host the browser
+  //     cannot reach). NEVER client-side.
   //   • iframe → never backend: AI runs client-side via the configured provider,
   //     Cribl via criblFetch (platform injects auth).
   // The old `&& !isAiConfigured()` clause was the bug: configuring an AI key
@@ -179,8 +299,10 @@ export function shouldUseBackendProxy(
   // browser-direct path (criblFetch to Cribl Cloud, no auth) → "No sample found"
   // and E0. Standalone routing must not depend on whether an AI key is set.
   if (mode === 'standalone') return true;
-  // Dev Proxy uses backend handlers only where those handlers actually exist.
-  if (provider === 'devproxy') return true;
+  // Dev Proxy uses backend handlers only where those handlers actually exist: the development
+  // build. A public build has no such handlers, so a `devproxy` left in shared App KV settings
+  // by an internal install in the same org must not reroute every call to a 404.
+  if (provider === 'devproxy' && INTERNAL_AI) return true;
   return false;
 }
 
@@ -266,7 +388,7 @@ export async function liveCapture(workerGroup: string, filter: string, maxEvents
 
 export async function listSamples(group: string): Promise<{ id: string; name: string; size: number; numEvents: number }[]> {
   if (shouldUseBackendProxy()) {
-    const resp = await fetch(`/api/pack-generator/samples?group=${encodeURIComponent(group)}`);
+    const resp = await devServerFetch(`/api/pack-generator/samples?group=${encodeURIComponent(group)}`);
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Failed to list samples');
     return data.samples;
@@ -375,16 +497,33 @@ export async function listGroupAndPackSamples(
   return [...system, ...packResults.flat()];
 }
 
-/** Save a sample at worker-group scope, replacing a same-name file. */
+/** Thrown by `uploadWorkerGroupSample` when the name is taken and `replace` was not asked for. */
+export class WorkerGroupSampleExists extends Error {
+  workerGroup: string;
+  sampleName: string;
+  constructor(workerGroup: string, sampleName: string) {
+    super(`A sample named ${sampleName} already exists in ${workerGroup}.`);
+    this.name = 'WorkerGroupSampleExists';
+    this.workerGroup = workerGroup;
+    this.sampleName = sampleName;
+  }
+}
+
+/** The worker-group samples collection path. */
 export function workerGroupSamplesPath(workerGroup: string): string {
   if (!workerGroup || /[/\\]/.test(workerGroup)) throw new Error('Invalid worker group.');
   return `/m/${workerGroup}/system/samples`;
 }
 
+/**
+ * Save a sample at worker-group scope. A same-name sample is only overwritten with
+ * `replace: true` — it may be anyone's, so the caller has to have asked.
+ */
 export async function uploadWorkerGroupSample(
   workerGroup: string,
   sampleName: string,
   events: string[],
+  opts: { replace?: boolean } = {},
 ): Promise<string> {
   if (!workerGroup || !sampleName || !events.length) throw new Error('Worker group, sample name and events are required.');
   if (shouldUseBackendProxy()) {
@@ -405,6 +544,7 @@ export async function uploadWorkerGroupSample(
     context: { events: events.map(raw => ({ _raw: raw, _time: Date.now() / 1000 })) },
   };
   if (existing?.id) {
+    if (!opts.replace) throw new WorkerGroupSampleExists(workerGroup, sampleName);
     await criblFetch(`${base}/${encodeURIComponent(existing.id)}`, {
       method: 'PATCH',
       body: JSON.stringify({ id: existing.id, ...sampleBody }),
@@ -544,7 +684,7 @@ export async function publishSanitisedSample(
   doc: SanitisedSampleDoc,
 ): Promise<{ published: boolean; reason?: string; error?: string }> {
   if (getRunMode() !== 'standalone') return { published: false, error: 'Publishing is standalone-only.' };
-  const settings = loadQualitySettings();
+  const settings = sampleIoSettings().sanitisedSharing();
   if (!settings.shareSanitisedSamples || !settings.sanitisedSampleTokenSet
     || sanitisedSampleRepoError(
       settings.sanitisedSampleRepo, settings.sanitisedSampleBranch, settings.goldenRepo,

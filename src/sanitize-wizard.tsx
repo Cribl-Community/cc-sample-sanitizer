@@ -11,16 +11,20 @@ import {
   publishSanitisedSample,
   saveSanitisedSample,
   uploadWorkerGroupSample,
+  WorkerGroupSampleExists,
 } from './sample-io';
 import {
   buildSanitisedSampleDoc,
   downloadSanitisedSamplePayload,
+  SANITISE_INPUT_MAX_BYTES,
+  SANITISED_SAMPLE_MAX_BYTES,
   sanitisedSampleKey,
   type SanitisedSampleDoc,
   type SanitisedSampleIndexRow,
 } from './sanitised-sample-store';
 import {
   applyAndVerifySanitisation,
+  describeResidual,
   runSanitisation,
   normaliseSampleInput,
   parseSampleLocally,
@@ -119,6 +123,14 @@ export interface SamplePick {
 }
 
 type SourceMode = 'upload' | 'paste' | 'group' | 'live-capture';
+/* What the evidence JSON and report say about where a sample came from. Deliberately not the
+   file or sample name: `acmebank-fw01-oct.log` names the customer the sample was taken from. */
+const SOURCE_MODE_LABEL: Record<SourceMode, string> = {
+  upload: 'uploaded file',
+  paste: 'pasted events',
+  group: 'worker-group sample',
+  'live-capture': 'live capture',
+};
 // Pick mode only: events that are not the user's own and need no sanitising.
 type PickSource = 'library' | 'saved';
 type Step = 'events' | 'source' | 'sanitize' | 'save';
@@ -211,6 +223,8 @@ export function SanitizeWizard({
   // reached (see the effect below), but the reviewer can rename it to anything valid before
   // uploading — an empty box means "use the default".
   const [groupSampleName, setGroupSampleName] = useState('');
+  // `group|name` the reviewer was told already exists; the next Upload on that target replaces it.
+  const [replaceTarget, setReplaceTarget] = useState('');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   // Set while `error` is the structure gate's banner. The verdict is then re-derived on every
@@ -1072,9 +1086,10 @@ export function SanitizeWizard({
       return;
     }
     const degraded = run.verification?.verdict === 'fail' && run.verificationBefore?.verdict !== 'fail';
-    const warning = degraded
-      ? `Sanitising changed the events enough that the ${sourcetype} parser no longer reads them cleanly: ${run.verification!.reasons.join(' ')}`
-      : null;
+    const warning = run.residual.length ? describeResidual(run.residual)
+      : degraded
+        ? `Sanitising changed the events enough that the ${sourcetype} parser no longer reads them cleanly: ${run.verification!.reasons.join(' ')}`
+        : null;
     let libraryNote: string | undefined;
     if (addToLibrary && !embedded) {
       setBusy('Saving to the library…');
@@ -1087,7 +1102,7 @@ export function SanitizeWizard({
           verification: verified.verification,
           provenance: {
             sourceMode,
-            sourceLabel: sourceLabel || `${sourceMode} sample`,
+            sourceLabel: SOURCE_MODE_LABEL[sourceMode],
             replacementsApplied: verified.replacementsApplied,
             structurePreserved: verified.structure.ok,
             coverage: {
@@ -1151,9 +1166,12 @@ export function SanitizeWizard({
       // false alarm that leaves the user with nothing to do but undo a sample that was fine.
       const degraded = run.verification?.verdict === 'fail'
         && run.verificationBefore?.verdict !== 'fail';
-      const warning = degraded
-        ? `Sanitising changed the events enough that the ${sourcetype} parser no longer reads them cleanly: ${run.verification!.reasons.join(' ')}`
-        : null;
+      // A leftover original outranks a parse warning: the sample is about to be treated as
+      // sanitised, so the reviewer must hear that it is not fully.
+      const warning = run.residual.length ? describeResidual(run.residual)
+        : degraded
+          ? `Sanitising changed the events enough that the ${sourcetype} parser no longer reads them cleanly: ${run.verification!.reasons.join(' ')}`
+          : null;
       onApply(run.events, sourcetype, warning);
       onClose();
       return;
@@ -1201,7 +1219,8 @@ export function SanitizeWizard({
     setStep('sanitize');
   }
 
-  function buildDoc(): SanitisedSampleDoc {
+  // `forDownload` skips the storage size limit: a downloaded file is not stored by the app.
+  function buildDoc(forDownload = false): SanitisedSampleDoc {
     if (!applied || !recognition) throw new Error('Apply and verify the sanitisation first.');
     return buildSanitisedSampleDoc({
       sourcetype,
@@ -1210,7 +1229,7 @@ export function SanitizeWizard({
       verification: applied.verification,
       provenance: {
         sourceMode,
-        sourceLabel: sourceLabel || `${sourceMode} sample`,
+        sourceLabel: SOURCE_MODE_LABEL[sourceMode],
         replacementsApplied: applied.replacementsApplied,
         structurePreserved: applied.structure.ok,
         coverage: {
@@ -1221,7 +1240,7 @@ export function SanitizeWizard({
         },
         sanitisedAt: new Date().toISOString(),
       },
-    });
+    }, { enforceStorageLimit: !forDownload });
   }
 
   // One card, one action. Runs the destination's own function, records its inline
@@ -1254,16 +1273,33 @@ export function SanitizeWizard({
       : saved.storedIn === 'app-kv' ? 'Saved in this app installation' : 'Saved in this browser';
   }
 
-  // Create or replace a group-level sample on the chosen worker group.
+  // The sample name an upload would use: the reviewer's, sanitised to a plain filename (Cribl
+  // expects one, so path separators go), or the key-derived default when the box is empty.
+  function uploadSampleName(): string {
+    // From the key alone, not buildDoc(): this also runs while rendering the button label.
+    const fallback = `${sanitisedSampleKey(sourcetype, recognition?.format.id).replace(/::/g, '__')}.log`;
+    let name = (groupSampleName.trim() || fallback).replace(/[/\\]/g, '_');
+    if (!/\.[a-z0-9]+$/i.test(name)) name += '.log';
+    return name;
+  }
+
+  // Create a group-level sample on the chosen worker group. A name that is already taken is
+  // only overwritten after the reviewer has been told and pressed Replace.
   async function uploadAction(): Promise<string> {
     if (!groupId) throw new Error('Choose the destination worker group.');
     const doc = buildDoc();
-    // Reviewer-chosen filename, sanitised to a safe sample name; an empty box falls back
-    // to the key-derived default. Cribl expects a plain filename, so strip path separators.
-    const fallback = `${doc.key.replace(/::/g, '__')}.log`;
-    let name = (groupSampleName.trim() || fallback).replace(/[/\\]/g, '_');
-    if (!/\.[a-z0-9]+$/i.test(name)) name += '.log';
-    await uploadWorkerGroupSample(groupId, name, doc.events);
+    const name = uploadSampleName();
+    const target = `${groupId}|${name}`;
+    try {
+      await uploadWorkerGroupSample(groupId, name, doc.events, { replace: replaceTarget === target });
+    } catch (err) {
+      if (err instanceof WorkerGroupSampleExists) {
+        setReplaceTarget(target);
+        throw new Error(`${err.message} Press Replace to overwrite it, or choose another name.`);
+      }
+      throw err;
+    }
+    setReplaceTarget('');
     return `Uploaded to ${groupId} as ${name}`;
   }
 
@@ -1404,7 +1440,7 @@ export function SanitizeWizard({
             </div>}
             {!pickSource && sourceMode === 'upload' && <div className="sz-drop" onClick={() => fileRef.current?.click()}>
               <strong>{sourceLabel || 'Choose a .log, .txt or .json file'}</strong>
-              <small>{raw ? `${raw.split('\n').filter(Boolean).length} events loaded` : 'The file stays in this browser.'}</small>
+              <small>{raw ? `${raw.split('\n').filter(Boolean).length} events loaded${raw.length > SANITISED_SAMPLE_MAX_BYTES ? ` — over ${SANITISED_SAMPLE_MAX_BYTES / 1e6} MB, so the result can be downloaded but not saved to the library or a worker group` : ''}` : 'The file stays in this browser.'}</small>
               {/* The input is a CHILD of the drop zone whose onClick calls fileRef.click(); a
                   programmatic click bubbles back here and would re-enter that onClick — an
                   infinite recursion that crashes the view. Stop the bubbled click at the input. */}
@@ -1414,8 +1450,15 @@ export function SanitizeWizard({
                   const file = event.target.files?.[0];
                   if (!file) return;
                   const input = event.currentTarget;
+                  // Refuse before reading: a file this size would freeze the tab in detection.
+                  if (file.size > SANITISE_INPUT_MAX_BYTES) {
+                    setError(`${file.name} is ${(file.size / 1e6).toFixed(1)} MB. The sanitiser reads files up to ${SANITISE_INPUT_MAX_BYTES / 1e6} MB — cut a representative slice (a few thousand lines is plenty) and load that.`);
+                    input.value = '';
+                    return;
+                  }
                   void file.text()
                     .then(text => { setRaw(normaliseSampleInput(text)); setSourceLabel(file.name); setError(''); })
+                    .catch(err => setError(`Could not read ${file.name}: ${err instanceof Error ? err.message : String(err)}`))
                     .finally(() => { input.value = ''; });
                 }} />
             </div>}
@@ -1490,21 +1533,50 @@ export function SanitizeWizard({
 
           {step === 'source' && <>
             <h3>{pickMode ? 'Confirm the sourcetype this sample names' : 'Confirm the source'}</h3>
-            <div className="sz-detected"><b>{recognition?.display || 'Source not recognised'}</b><span>auto-detected · {recognition?.confidence} confidence · {recognition?.method} · offline</span></div>
-            <p>{recognition?.reason}</p>
-            {!!recognition?.alternatives?.length && <div className="sz-note" style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-              <span>Not right? Other close matches:</span>
-              {recognition.alternatives.map(alt => (
-                <button key={alt} type="button" className="sz-secondary"
-                  aria-pressed={canonicalizeSourcetype(sourcetype) === alt}
-                  onClick={() => setSourcetype(alt)}>{alt}</button>
-              ))}
-            </div>}
-            <label className="sz-field">Sourcetype
-              <input value={sourcetype} onChange={event => setSourcetype(event.target.value)}
-                placeholder="start typing — e.g. cisco_asa, pan_traffic_syslog"
-                list="sz-sourcetype-catalog" autoComplete="off" spellCheck={false} />
-            </label>
+            {/* The same detected-sourcetype card as the Pack Generator's Source step (App.tsx,
+                "Detected sourcetype"), built from the same App.css classes so the two cannot drift:
+                the name, a confidence badge, why, and an override that is live as you type. A
+                format-only result (self-describing JSON/XML with no named source) is the Pack
+                Generator's "could not be auto-detected" variant. */}
+            {(() => {
+              const named = !!recognition && recognition.method !== 'format-only' && !!recognition.sourcetype;
+              const overridden = named && !!sourcetype.trim() && canonicalizeSourcetype(sourcetype) !== canonicalizeSourcetype(recognition!.sourcetype);
+              return (
+                <div className="ai-generate-options sz-detect-card">
+                  {named ? <>
+                    <label>Detected sourcetype</label>
+                    <div className="sz-detect-row">
+                      <code className="sz-detect-name">{recognition!.sourcetype}</code>
+                      <span className={`type-badge type-${recognition!.confidence === 'high' ? 'stream' : 'edge'}`}>{recognition!.confidence} confidence</span>
+                      <span className="type-badge type-outpost">offline</span>
+                    </div>
+                    {recognition!.reason && <p className="gen-tier-note sz-detect-reason">{recognition!.reason}</p>}
+                    {overridden && <p className="gen-tier-note sz-detect-reason">Using your sourcetype “{sourcetype.trim()}” instead.</p>}
+                    {!!recognition!.alternatives?.length && <div className="sz-detect-alts">
+                      <span className="gen-tier-note">Other close matches:</span>
+                      {recognition!.alternatives.map(alt => (
+                        <button key={alt} type="button" className="sz-secondary"
+                          aria-pressed={canonicalizeSourcetype(sourcetype) === alt}
+                          onClick={() => setSourcetype(alt)}>{alt}</button>
+                      ))}
+                    </div>}
+                    <label className="sz-detect-override-label">Not right? Enter the correct sourcetype:</label>
+                  </> : <>
+                    <label>Sourcetype could not be auto-detected</label>
+                    {recognition?.reason && <p className="gen-tier-note sz-detect-reason">{recognition.reason}</p>}
+                    <p className="gen-tier-note sz-detect-reason">Enter the sourcetype manually:</p>
+                  </>}
+                  <div className="custom-input-inline sz-detect-input">
+                    <input type="text" aria-label="Sourcetype" value={sourcetype}
+                      onChange={event => setSourcetype(event.target.value)}
+                      placeholder={named ? 'Override sourcetype...' : 'e.g. cisco_asa, palo_alto_traffic'}
+                      list="sz-sourcetype-catalog" autoComplete="off" spellCheck={false} />
+                    <button type="button" className="confirm-btn" disabled={!sourcetype.trim()}
+                      onClick={() => setSourcetype(sourcetype.trim())}>Use this</button>
+                  </div>
+                </div>
+              );
+            })()}
             <datalist id="sz-sourcetype-catalog">
               {sourcetypeCatalog.map(name => <option key={name} value={name} />)}
             </datalist>
@@ -1963,10 +2035,26 @@ export function SanitizeWizard({
 
           {step === 'save' && applied && <>
             <h3>Save or share the sanitised sample</h3>
-            <div className="sz-proof">
-              <b>✓ Structure preserved</b><span>✓ Parser: {applied.verification.verdict}</span>
-              <span>{applied.replacementsApplied} identities replaced</span>
-            </div>
+            {/* ✓ only for a pass. A fail can only reach this step when the ORIGINAL failed the same
+                parser check (applyAndVerifySanitisation blocks a regression), so say exactly that,
+                with the reason, instead of a green tick next to the word "fail" (build 1009). */}
+            {(() => {
+              const v = applied.verification;
+              const before = applied.verificationBefore;
+              const parser = applied.parserName || canonicalizeSourcetype(sourcetype) || 'source';
+              return (
+                <div className="sz-proof">
+                  <b>✓ Structure preserved</b>
+                  {v.verdict === 'pass' && <span>✓ Parser check: pass — the {parser} parser reads {v.eventsParsed} of {v.eventsChecked} checked events</span>}
+                  {v.verdict === 'unverified' && <span>– Parser check: not available — {v.reasons[0] || 'no parser to check against'}</span>}
+                  {v.verdict === 'fail' && <span className="sz-proof-warn">
+                    ⚠ Parser check: fail{before?.verdict === 'fail' ? ' — the original fails it the same way, so sanitising did not cause it' : ''}.
+                    {v.reasons.length ? ` ${v.reasons.join(' ')}` : ''}
+                  </span>}
+                  <span>{applied.replacementsApplied} identities replaced</span>
+                </div>
+              );
+            })()}
 
             {/* Pack Generator only — the standalone Sample Sanitizer (embedded) has no local
                 sample library that anything consumes, so this destination is omitted there. */}
@@ -1984,7 +2072,7 @@ export function SanitizeWizard({
 
             <div className="sz-action">
               <b>Upload to worker group</b>
-              <small>Creates or replaces a group-level sample both the pack generator and the standalone Sample Sanitizer can reuse — and a Stream pipeline can use directly. Select it in Routes / QuickConnect. No AI, no original data leaves the browser.</small>
+              <small>Creates a group-level sample both the pack generator and the standalone Sample Sanitizer can reuse — and a Stream pipeline can use directly. Select it in Routes / QuickConnect. An existing sample of the same name is only replaced after you confirm. No AI, no original data leaves the browser.</small>
               <div className="sz-dest-sub">
                 <label className="sz-field">Worker group
                   <select value={groupId} onChange={e => setGroupId(e.target.value)}>
@@ -1998,7 +2086,9 @@ export function SanitizeWizard({
                   : actionDone.upload ? <span className="sz-action-msg ok">✓ {actionDone.upload}</span>
                   : <span className="sz-action-hint" />}
                 <button className="sz-btn" disabled={!!actionBusy} onClick={() => void runAction('upload', uploadAction)}>
-                  {actionBusy === 'upload' ? 'Uploading…' : actionDone.upload ? 'Upload again' : 'Upload to worker group'}</button>
+                  {actionBusy === 'upload' ? 'Uploading…'
+                    : replaceTarget && replaceTarget === `${groupId}|${uploadSampleName()}` ? 'Replace'
+                    : actionDone.upload ? 'Upload again' : 'Upload to worker group'}</button>
               </div>
             </div>
 
@@ -2007,7 +2097,7 @@ export function SanitizeWizard({
               <small>Saves the de-identified <code>.log</code> to your machine — the sanitised events, ready to share or attach.</small>
               <div className="sz-action-bar">
                 {actionDone.download ? <span className="sz-action-msg ok">✓ {actionDone.download}</span> : <span className="sz-action-hint" />}
-                <button className="sz-btn" onClick={() => void runAction('download', () => { triggerDownload(buildDoc(), 'log'); return 'Downloaded sanitised .log'; })}>⤓ Download .log</button>
+                <button className="sz-btn" onClick={() => void runAction('download', () => { triggerDownload(buildDoc(true), 'log'); return 'Downloaded sanitised .log'; })}>⤓ Download .log</button>
               </div>
             </div>
 
@@ -2031,8 +2121,8 @@ export function SanitizeWizard({
             {/* The report and evidence JSON are their own downloads — not the sanitised log —
                 so they sit on their own row at the bottom, styled like the other actions. */}
             <div className="sz-downloads">
-              <button className="sz-btn" onClick={() => triggerDownload(buildDoc(), 'report')}>⤓ Download report (HTML / PDF)</button>
-              <button className="sz-btn" onClick={() => triggerDownload(buildDoc(), 'json')}>⤓ Download evidence JSON</button>
+              <button className="sz-btn" onClick={() => triggerDownload(buildDoc(true), 'report')}>⤓ Download report (HTML / PDF)</button>
+              <button className="sz-btn" onClick={() => triggerDownload(buildDoc(true), 'json')}>⤓ Download evidence JSON</button>
             </div>
           </>}
         </main>

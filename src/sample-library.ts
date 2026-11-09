@@ -28,6 +28,7 @@ import {
   getParserForSourcetype,
   sampleFingerprint,
   sampleMatchesSourceExpectation,
+  unwrapJsonRaw,
   type PipelineFunction,
 } from './source-recognition';
 import sourcetypeAliasData from '../config/sourcetype-aliases.json';
@@ -502,6 +503,10 @@ export function verifyGeneratedSample(
   }
 
   const checked = list.slice(0, MAX_EVENTS_CHECKED);
+  /* The wire-format expectation is about the EVENT, so a Cribl JSON export line
+     (`{"_raw":"CEF:0|…","_time":…}`) is judged by its `_raw`. Judged whole, every worker-group
+     or Search export of a CEF/kvp source read as "wrong log family" (build 1009). */
+  const expectationText = checked.map(line => unwrapJsonRaw(line.trim()).text).join('\n');
   const keyEcho = detectKeyEcho(sourcetype, checked);
   // A fabricated sample can still satisfy every structural check — the events are
   // well-formed, they just describe a log nobody ships. So this verdict is applied
@@ -562,7 +567,7 @@ export function verifyGeneratedSample(
     // A wrong-format sample can still satisfy a permissive parser (a kvp serde
     // happily reads `k=v` out of the wrong vendor's log), so the expectation
     // check is applied as well when one is declared.
-    if (sampleMatchesSourceExpectation(sourcetype, checked.join('\n')) === 'mismatch') {
+    if (sampleMatchesSourceExpectation(sourcetype, expectationText) === 'mismatch') {
       reasons.push(`the events do not match the wire format declared for ${sourcetype} (wrong log family or missing critical keys)`);
     }
     return withEcho({
@@ -575,7 +580,7 @@ export function verifyGeneratedSample(
   }
 
   // No emulatable extractor (lookup/code-driven parser, or no parser at all).
-  const expectation = sampleMatchesSourceExpectation(sourcetype, checked.join('\n'));
+  const expectation = sampleMatchesSourceExpectation(sourcetype, expectationText);
   if (expectation === 'match') {
     return withEcho({
       ...base, verdict: 'pass', method: 'source-expectation', eventsChecked: checked.length,
@@ -1657,7 +1662,7 @@ Emit ${want} additional ${sourcetype} events in exactly this format, one per lin
  * It is a ceiling, not a reservation — an answer that needs 5 K tokens is billed as 5 K
  * whatever the ceiling says — so there is no reason to send anything smaller, and one
  * very good reason not to: on a reasoning model the thinking comes out of the SAME
- * allowance as the answer. Measured on sonnet-5 via Aperture, a 530-char CEF source
+ * allowance as the answer. Measured on a reasoning model, a 530-char CEF source
  * asked for 27 lines within 16000 tokens returned ZERO text three times out of three
  * (`stop_reason: max_tokens`, `thinking_tokens: 16000`, no text block at all); the same
  * source at 32000 returned all 16 requested lines in 90s. What bounds the cost here is

@@ -84,6 +84,14 @@ export interface SanitiseEntry {
    */
   confidence: 'certain' | 'suspect';
   /**
+   * Also replace the value where it STARTS a hyphenated token: `SG-ENG` inside
+   * `SG-ENG-simplified`. Off by default, because `web01` must not be rewritten inside
+   * `web01-backup`; set for a distinguished-name component (a Check Point gateway name is
+   * reused as the prefix of its policy layer name), where leaving that prefix would leak the
+   * identity and trip the residual scan.
+   */
+  prefixOk?: boolean;
+  /**
    * For a shape/pattern pick: the slices of `original` that actually change.
    *
    * Apply still replaces the whole `original` with `alias` (so `8196` inside
@@ -429,6 +437,9 @@ export function fieldIdentityKind(rawName: string): IdentityKind | null {
 // ---------------------------------------------------------------------------
 
 const EMAIL_RE = /\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b/g;
+/* The same mailbox percent-encoded, as it sits in a URL query string (`?u=jsmith%40acme.com`).
+   Without it only the domain part was caught as an FQDN and the account name stayed. */
+const EMAIL_ENC_RE = /\b[\w.+-]+%40[\w-]+(?:\.[\w-]+)+\b/gi;
 const MAC_RE = /\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b/gi;
 /* Anchored so a filesystem path is not read as DOMAIN\user: `C:\Windows\system32` would
    otherwise yield host `Windows` and user `system32`. The domain must not follow a path
@@ -441,6 +452,38 @@ const WINUSER_RE = /(?<![\\/:])\b([A-Za-z][\w-]{1,30})\\([\w.$-]{1,64})\b(?![\w.
    a `\` produces an invalid escape (`\c`) that breaks the JSON. So JSON lines require the
    doubled backslash. */
 const WINUSER_JSON_RE = /(?<![\\/:])\b([A-Za-z][\w-]{1,30})\\\\([\w.$-]{1,64})\b(?![\w.$-]*(?:\\\\|\/))/g;
+/* Non-global copies for a per-value `.test()` (a /g regex keeps lastIndex between calls). */
+const WINUSER_SINGLE = new RegExp(WINUSER_RE.source);
+const WINUSER_DOUBLE = new RegExp(WINUSER_JSON_RE.source);
+
+/* `CN\=gw01,O\=corp` / `CN\\=gw01,O\\=corp` / `CN=gw01,OU=x,O=corp`: two or more
+   `LABEL=value` components joined by commas, where the `=` may be backslash-escaped.
+   Labels are the standard X.500 / LDAP attribute names only, so a nested `a=1,b=2` list
+   in some other field is not mistaken for a DN. */
+const DN_LABEL = String.raw`(?:CN|OU|O|L|ST|C|DC|E|UID|SN|STREET|EMAILADDRESS)`;
+const DN_COMPONENT_RE = new RegExp(String.raw`\b(${DN_LABEL})\\*=([^,]*)`, 'gi');
+const DN_SHAPE_RE = new RegExp(String.raw`^${DN_LABEL}\\*=[^,]*(?:,\s*${DN_LABEL}\\*=[^,]*)+$`, 'i');
+
+/* The same shape found inside a line: component values stop at a comma, whitespace, a quote
+   or a backslash, so the next `key=` and the JSON around the value are never swallowed. */
+const DN_TEXT_RE = new RegExp(String.raw`(?<![\w])${DN_LABEL}\\*=[^,\s"\\]+(?:,${DN_LABEL}\\*=[^,\s"\\]+)+`, 'gi');
+
+/** The component values of a distinguished name, or null when the value is not one. */
+export function dnComponentValues(value: string): string[] | null {
+  if (!DN_SHAPE_RE.test(value)) return null;
+  const out: string[] = [];
+  for (const m of value.matchAll(DN_COMPONENT_RE)) {
+    const v = m[2].trim();
+    if (v) out.push(v);
+  }
+  return out.length ? out : null;
+}
+
+/** The label (`CN`, `O`, …) a component value sits under, for the "found via" note. */
+function dnLabelOf(value: string, part: string): string {
+  for (const m of value.matchAll(DN_COMPONENT_RE)) if (m[2].trim() === part) return m[1].toUpperCase();
+  return 'DN';
+}
 
 /**
  * Usernames that free-text login messages put in a fixed phrase rather than a field.
@@ -477,7 +520,7 @@ function lineLooksLikeJson(line: string): boolean {
 }
 /* An FQDN needs a plausible TLD, otherwise every `foo.bar` in a stack trace, file name
    or version string matches. */
-const FQDN_RE = /\b(?![\d.]+\b)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.(?:com|net|org|local|internal|lan|corp|io|co|gov|edu|mil|de|nl|uk|fr|be|example|test)\b/gi;
+const FQDN_RE = /\b(?![\d.]+\b)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.(?:com|net|org|local|internal|lan|corp|io|co|gov|edu|mil|de|nl|uk|fr|be|example|test|info|biz|app|dev|cloud|ai|me|eu|int|us|ca|au|nz|ch|at|se|no|dk|fi|es|it|pt|pl|cz|ie|lu|gr|hu|ro|sk|si|ee|lv|lt|bg|hr|jp|cn|kr|tw|hk|sg|my|th|vn|ph|br|mx|ar|cl|za|ru|tr|il|ae|sa)\b/gi;
 /** The same shape, anchored, for testing one value rather than scanning a line. */
 const FQDN_ONE = new RegExp(`^${FQDN_RE.source.replace(/\\b/g, '')}$`, 'i');
 
@@ -799,10 +842,12 @@ class AliasMinter {
   }
 
   email(original: string): string {
-    const [local, domain] = original.split('@');
+    // A URL-encoded mailbox keeps its `%40`, so the alias reads the same way in the query string.
+    const sep = original.includes('@') ? '@' : '%40';
+    const [local, domain] = original.split(/@|%40/i);
     const user = this.user(local);
     const dom = domain && NEVER.has(domain.toLowerCase()) ? domain : this.pick(SAFE_TLD);
-    return `${user}@${dom}`;
+    return `${user}${sep}${dom}`;
   }
 
   mac(): string {
@@ -1439,13 +1484,37 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
       const value = rawValue.trim().replace(/^"(.*)"$/, '$1').trim();
       if (!value || value.length > 120 || isNever(value)) continue;
       const hinted = hints.identityFields.has(name.toLowerCase());
-      const kind = fieldIdentityKind(name) || (hinted ? 'custom' : null);
+      /* A distinguished name is an identity whatever the field is called: a certificate
+         subject names a host and an organisation. */
+      const kind = fieldIdentityKind(name) || (hinted || dnComponentValues(value) ? 'custom' : null);
       if (!kind) continue;
       /* Already settled by a text-wide pattern, and better handled there: an address in
          `src_ip`, a UPN in `user`, a `DOMAIN\account`, an FQDN in `host`. Handing an FQDN
          to the host minter would collapse `web01.corp.local` to a single label and break
          every parser that splits it on dots. */
-      if (IPV4_ONE.test(value) || value.includes('@') || value.includes('\\')) continue;
+      if (IPV4_ONE.test(value) || value.includes('@')) continue;
+      /* A certificate distinguished name — Check Point's `originsicname` is
+         `CN\=gw01,O\=corp..x7k2` — names a gateway and an organisation in one value. Each
+         component is minted on its own so the `CN\=`/`O\=` labels, the escaping and the
+         commas survive, and the sample still parses. Before this, the backslash skip below
+         dropped the value and nothing else caught it, so the coverage proof flagged a field
+         that was never offered. */
+      const dn = dnComponentValues(value);
+      if (dn) {
+        for (const part of dn) {
+          if (isNever(part) || !line.includes(part)) continue;
+          if (/^[\d.]+$/.test(part)) continue;
+          const before = found.size;
+          add(part, 'custom', `parsed field “${name}” (${dnLabelOf(value, part)})`);
+          const entry = found.get(part);
+          if (entry) entry.prefixOk = true;
+          if (found.size > before) tally.parser++;
+        }
+        continue;
+      }
+      /* `DOMAIN\user` is settled by the text-wide pattern below, which keeps the separator.
+         Any other backslashed value is skipped only when that pattern actually covers it. */
+      if (value.includes('\\') && (WINUSER_SINGLE.test(value) || WINUSER_DOUBLE.test(value) || !line.includes(value))) continue;
       if (value.includes('.') && FQDN_ONE.test(value)) continue;
       if (kind === 'ipv4' || kind === 'ipv6') continue;   // an address field without an address
       /* Purely numeric values are ports, counters and record ids — except where a hint
@@ -1501,7 +1570,20 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
     }
 
     for (const m of line.matchAll(EMAIL_RE)) patternAdd(m[0], 'email', 'email pattern');
+    for (const m of line.matchAll(EMAIL_ENC_RE)) patternAdd(m[0], 'email', 'URL-encoded email pattern');
     for (const m of line.matchAll(MAC_RE)) patternAdd(m[0], 'mac', 'MAC pattern');
+
+    /* A distinguished name anywhere in the line, for samples whose parser did not split the
+       field out (a CEF event inside a JSON `_raw` with no sourcetype yet). Components are
+       added singly and may prefix a hyphenated token, exactly as the parsed-field pass does. */
+    for (const m of line.matchAll(DN_TEXT_RE)) {
+      for (const part of dnComponentValues(m[0]) || []) {
+        if (isNever(part) || /^[\d.]+$/.test(part)) continue;
+        patternAdd(part, 'custom', `distinguished-name pattern (${dnLabelOf(m[0], part)})`);
+        const entry = found.get(part);
+        if (entry) entry.prefixOk = true;
+      }
+    }
 
     // `CORP\jsmith`: the domain and the account are separate identities, and the
     // backslash has to survive so the DOMAIN\user shape is intact. On a JSON line the
@@ -1813,9 +1895,9 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
   const enabledOnly = buildReplacer(candidates.filter(e => e.enabled));
   if (all) {
     text.replace(all.re, (hit: string, offset: number) => {
-      if (inJsonKey(text, offset, offset + hit.length)) return hit;
-      hits.set(hit, (hits.get(hit) ?? 0) + 1);
-      const e = all.byValue.get(hit)!;
+      const e = entryFor(all, hit);
+      if (!e || keepsJsonKey(text, offset, offset + hit.length, e)) return hit;
+      hits.set(e.original, (hits.get(e.original) ?? 0) + 1);
       /* A pick consumes its whole match, but apply still masks the auto-detected values in its
          context (expandHit) — count those too, or the IP inside `<ip> - (?<user>…) [` scores
          zero here and its row is dropped, leaving the IP in the clear on every picked line. */
@@ -1832,7 +1914,8 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
          `mbrennan@acme-corp.com` left unticked must not shelter `acme-corp.com`. */
       if (enabledOnly) {
         hit.replace(enabledOnly.re, inner => {
-          hits.set(inner, (hits.get(inner) ?? 0) + 1);
+          const original = entryFor(enabledOnly, inner)?.original;
+          if (original) hits.set(original, (hits.get(original) ?? 0) + 1);
           return '';
         });
       }
@@ -1941,7 +2024,8 @@ function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '
  * `compute.googleapis.com`, and a user called `admin` rewrote an `"admin": true` flag. The save
  * gate then refused the whole sample ("changed their field names") with nothing the reviewer
  * could untick that made sense. Keys are the schema the pack is built against, not identity, so
- * the matcher leaves them alone (`inJsonKey`) and only values change.
+ * the matcher leaves them alone (`keepsJsonKey`) and only values change — except a key that is,
+ * as a whole, an email, IP or MAC address (`KEYABLE_KINDS`).
  *
  * Memoised on the last text: every caller asks about the same sample (or line) once per hit.
  */
@@ -1972,17 +2056,33 @@ function jsonKeySpans(text: string): number[] {
   return spans;
 }
 
-/** True when `[start, end)` lies inside one JSON object key of `text` (see `jsonKeySpans`). */
-function inJsonKey(text: string, start: number, end: number): boolean {
+/** The JSON object key `[start, end)` lies inside, as `[keyStart, keyEnd]`, or null (see `jsonKeySpans`). */
+function jsonKeySpanAt(text: string, start: number, end: number): [number, number] | null {
   const spans = jsonKeySpans(text);
   let lo = 0, hi = spans.length / 2 - 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
     if (spans[2 * mid + 1] <= start) lo = mid + 1;
     else if (spans[2 * mid] > start) hi = mid - 1;
-    else return end <= spans[2 * mid + 1];
+    else return end <= spans[2 * mid + 1] ? [spans[2 * mid], spans[2 * mid + 1]] : null;
   }
-  return false;
+  return null;
+}
+
+/* Kinds whose literal is never a field name. A JSON key that is EXACTLY one of these is data —
+   a map keyed by mailbox or address (`{"quota":{"jsmith@acme.com":5}}`) — so it is replaced like
+   any value. A user or host name is deliberately not on the list: `admin`, `root` and dotted
+   names such as `user.id` are just as often the schema itself, which is what #259 protected. */
+const KEYABLE_KINDS = new Set<IdentityKind>(['email', 'ipv4', 'ipv6', 'mac']);
+
+/**
+ * True when a hit at `[start, end)` must be left alone because it sits in a JSON key. The only
+ * key the sanitiser rewrites is one that is, as a whole, an email, IP or MAC address.
+ */
+function keepsJsonKey(text: string, start: number, end: number, entry: SanitiseEntry): boolean {
+  const span = jsonKeySpanAt(text, start, end);
+  if (!span) return false;
+  return !(KEYABLE_KINDS.has(entry.kind) && span[0] === start && span[1] === end);
 }
 
 /**
@@ -2008,13 +2108,35 @@ function inJsonKey(text: string, start: number, end: number): boolean {
  * domain. Callers pass entries already sorted longest-first and this preserves that order,
  * which is also what makes a single pass equivalent to the old sequential one.
  */
+/* Kinds whose values are case-insensitive identifiers: DNS names, mailboxes and account names.
+   `FW-ACME01` in a syslog header and `fw-acme01` in the message are the same device. Secrets and
+   free-form picks stay case-sensitive. */
+const CASELESS_KINDS = new Set<IdentityKind>(['host', 'user', 'email', 'fqdn']);
+/* Kinds whose literal can never continue past a `-`, so an address stays itself next to one —
+   which is how ranges are written (`81.2.69.160-81.2.69.170`). */
+const ADDRESS_KINDS = new Set<IdentityKind>(['ipv4', 'ipv6', 'mac']);
+
 function buildReplacer(entries: SanitiseEntry[]) {
   const byValue = new Map(entries.map(e => [e.original, e]));
   if (!byValue.size) return null;
-  /* `(?![\w.$-])` rather than `\b`: `\b` would fire in the middle of an FQDN or a dotted
-     account name, which is exactly the boundary that matters here. The guard is hoisted OUT of
-     the alternation and written once, not per value — a businessevent.log yields tens of
-     thousands of entries and a per-branch guard makes the regex (and the scan) grow with them.
+  /* The combined regex is case-insensitive (`i`), and THIS lookup decides what a hit is: the exact
+     value first, so a separately detected `fw-acme01` keeps its own alias; then a case variant of
+     a caseless value. A case variant of anything else — a secret, a pick — has no entry and is
+     left alone, exactly as before. Per-letter `[uU][sS]…` classes would have kept the regex itself
+     case-exact, but they defeat the engine's literal fast path: 16× slower on 2,000 user names. */
+  const byCaseless = new Map<string, SanitiseEntry>();
+  for (const e of byValue.values()) {
+    if (CASELESS_KINDS.has(e.kind) && e.via !== PICKED_PATTERN_VIA && !byCaseless.has(e.original.toLowerCase())) byCaseless.set(e.original.toLowerCase(), e);
+  }
+  /* `(?![\w.$-])`-style guards rather than `\b`: `\b` would fire in the middle of an FQDN or a
+     dotted account name, which is exactly the boundary that matters here. The guard is hoisted OUT
+     of the alternation and written once per group, not per value — a businessevent.log yields
+     tens of thousands of entries and a per-branch guard makes the regex (and the scan) grow with
+     them.
+     A `.` or `-` AFTER a value only blocks the match when a word character follows it: `web01` is
+     not replaced inside `web01.corp.local` or `web01-backup`, but `login from 81.2.69.160.` at the
+     end of a sentence is. Addresses get their own group whose guard also lets a `-` sit right
+     before or after them, so both ends of a range are masked.
      A user-picked pattern is the exception. Its own regex already fixed where the match begins
      and ends, and that span can legitimately start or end mid-word — `product_id=Goats&…` picked
      as `_id=Goats&…` begins right after `product`. A boundary guard would then refuse to re-find
@@ -2022,22 +2144,41 @@ function buildReplacer(entries: SanitiseEntry[]) {
      zero hits, and the row would silently vanish from the preview even though the pattern matched.
      So the (few, explicit) pattern picks are matched as their exact literal, unguarded and FIRST
      so a pick wins over an auto-detected sub-match nested inside it; everything else stays in the
-     one hoisted-guard group. When there are no picks this is byte-for-byte the old fast regex. */
+     guarded groups. */
   const all = [...byValue.values()];
   const guarded = all.filter(e => e.via !== PICKED_PATTERN_VIA);
-  const branches = all.filter(e => e.via === PICKED_PATTERN_VIA).map(e => escapeRe(e.original));
-  if (guarded.length) {
-    branches.push(`(?<![\\w.$-])(?:${guarded.map(e => escapeRe(e.original)).join('|')})(?![\\w.$-])`);
-  }
-  const re = new RegExp(branches.length > 1 ? `(?:${branches.join('|')})` : branches[0], 'g');
+  const literal = (e: SanitiseEntry) => escapeRe(e.original);
+  const groups = (list: SanitiseEntry[]) => {
+    const words = list.filter(e => !ADDRESS_KINDS.has(e.kind) && !e.prefixOk);
+    const prefixes = list.filter(e => !ADDRESS_KINDS.has(e.kind) && e.prefixOk);
+    const addresses = list.filter(e => ADDRESS_KINDS.has(e.kind));
+    const out: string[] = [];
+    if (words.length) out.push(`(?<![\\w.$-])(?:${words.map(literal).join('|')})(?![\\w$]|[.-]\\w)`);
+    /* Longest first inside the prefix group, so `SG-ENG` cannot beat a separate `SG-ENG-EU`;
+       after the strict group, so a separately detected `SG-ENG-simplified` still wins whole. */
+    if (prefixes.length) out.push(`(?<![\\w.$-])(?:${[...prefixes].sort((a, b) => b.original.length - a.original.length).map(literal).join('|')})(?![\\w$]|\\.\\w)`);
+    if (addresses.length) out.push(`(?<![\\w.$])(?:${addresses.map(literal).join('|')})(?![\\w$]|\\.\\w)`);
+    return out;
+  };
+  const branches = [...all.filter(e => e.via === PICKED_PATTERN_VIA).map(e => escapeRe(e.original)), ...groups(guarded)];
+  const re = new RegExp(branches.length > 1 ? `(?:${branches.join('|')})` : branches[0], 'gi');
   /* The auto-detected entries on their own, for the text AROUND a pick's groups. A pick wins
      the alternation over anything nested in it, so without this second pass the IP in a
      `<ip> - (?<user>…) [<date>]` pick would be written back verbatim — masked on the lines the
      pick does not touch and leaked on every line it does. */
-  const inner = all.length > guarded.length && guarded.length
-    ? new RegExp(`(?<![\\w.$-])(?:${guarded.map(e => escapeRe(e.original)).join('|')})(?![\\w.$-])`, 'g')
+  const innerBranches = all.length > guarded.length && guarded.length ? groups(guarded) : [];
+  const inner = innerBranches.length
+    ? new RegExp(innerBranches.length > 1 ? `(?:${innerBranches.join('|')})` : innerBranches[0], 'gi')
     : null;
-  return { re, inner, byValue };
+  return { re, inner, byValue, byCaseless };
+}
+
+/**
+ * The entry a replacer hit belongs to: the exact value first, then a case variant of a caseless
+ * one. Undefined for a case variant of a case-sensitive value — callers leave that text alone.
+ */
+function entryFor(m: { byValue: Map<string, SanitiseEntry>; byCaseless: Map<string, SanitiseEntry> }, hit: string): SanitiseEntry | undefined {
+  return m.byValue.get(hit) ?? m.byCaseless.get(hit.toLowerCase());
 }
 
 type Replacer = NonNullable<ReturnType<typeof buildReplacer>>;
@@ -2107,8 +2248,8 @@ function expandHit(text: string, index: number, matched: string, entry: Sanitise
     for (let h = inner.exec(text); h && h.index < index + end; h = inner.exec(text)) {
       const rs = h.index - index, re = rs + h[0].length;
       if (re > end) break;
-      if (inJsonKey(text, h.index, h.index + h[0].length)) continue;
-      const e = m.byValue.get(h[0])!;
+      const e = entryFor(m, h[0]);
+      if (!e || keepsJsonKey(text, h.index, h.index + h[0].length, e)) continue;
       out += matched.slice(cursor, rs);
       pieces.push({ bStart: rs, bEnd: re, aStart: out.length, aEnd: out.length + e.alias.length, entry: e });
       out += e.alias;
@@ -2157,8 +2298,8 @@ export function markSanitisation(text: string, entries: SanitiseEntry[]): Saniti
   const spans: SanitiseSpan[] = [];
   m.re.lastIndex = 0;
   for (let hit = m.re.exec(text); hit; hit = m.re.exec(text)) {
-    if (inJsonKey(text, hit.index, hit.index + hit[0].length)) continue;
-    const entry = m.byValue.get(hit[0])!;
+    const entry = entryFor(m, hit[0]);
+    if (!entry || keepsJsonKey(text, hit.index, hit.index + hit[0].length, entry)) continue;
     for (const p of expandHit(text, hit.index, hit[0], entry, m).pieces) {
       spans.push({ start: hit.index + p.bStart, end: hit.index + p.bEnd, entry: p.entry });
     }
@@ -2211,8 +2352,10 @@ export function applySanitisation(text: string, entries: SanitiseEntry[]): strin
   if (!m) return text;
   /* A function replacer, so an alias is inserted literally. A machine-account alias ends in
      `$`, and `$&` in a string replacement would splice the match back in. */
-  return text.replace(m.re, (hit: string, offset: number) =>
-    inJsonKey(text, offset, offset + hit.length) ? hit : expandHit(text, offset, hit, m.byValue.get(hit)!, m).alias);
+  return text.replace(m.re, (hit: string, offset: number) => {
+    const entry = entryFor(m, hit);
+    return !entry || keepsJsonKey(text, offset, offset + hit.length, entry) ? hit : expandHit(text, offset, hit, entry, m).alias;
+  });
 }
 
 export interface PreviewLine {
@@ -2294,8 +2437,8 @@ export function previewSanitisation(
     let changed = false;
     for (let hit = m.re.exec(before); hit; hit = m.re.exec(before)) {
       const matched = hit[0];
-      if (inJsonKey(before, hit.index, hit.index + matched.length)) continue;
-      const entry = m.byValue.get(matched)!;
+      const entry = entryFor(m, matched);
+      if (!entry || keepsJsonKey(before, hit.index, hit.index + matched.length, entry)) continue;
       after += before.slice(at, hit.index);
       const aStart = after.length;
       /* A pattern pick keeps its punctuation and only swaps the captured sub-runs (plus any
@@ -2408,6 +2551,71 @@ export function proveIdentityCoverage(
   return { total, replaced, remaining, blind: readable === 0, ok: readable > 0 && remaining.length === 0 };
 }
 
+/** One enabled original that still appears in the sanitised text. */
+export interface ResidualHit {
+  kind: IdentityKind;
+  value: string;
+  /** 1-based line number in the sanitised text. */
+  line: number;
+}
+
+/**
+ * Search the WHOLE sanitised text for every value the reviewer chose to replace, and report
+ * the ones that are still there.
+ *
+ * `proveIdentityCoverage` only sees what a parser can read, and only the lines it parsed, so a
+ * value in free text, in a field no parser names, or past the parse cap could survive without
+ * it noticing. The replacer's own guard is a second gap: it will not touch a value directly
+ * followed by `.` or `-`, so `login from 81.2.69.160.` and an IP range came through verbatim.
+ * This is the final word on the one question that matters — "is any original left?" — asked of
+ * the text itself instead of a parse of it.
+ *
+ * The match is case-insensitive and bounded by letters, digits and `_` only, so a value next to
+ * punctuation counts but `10.0.0.1` does not match inside `10.0.0.15`. Two places are excluded
+ * on purpose: JSON object keys (the replacer never rewrites a key — see `jsonKeySpans`), and the
+ * aliases themselves, so an alias the reviewer typed that contains its original is not a hit.
+ */
+export function findResidualOriginals(text: string, entries: SanitiseEntry[], limit = 50): ResidualHit[] {
+  const live = entries.filter(e => e.enabled && e.alias && e.alias !== e.original && e.original.trim());
+  if (!live.length) return [];
+  // Blank every alias to same-length filler so offsets (and so line numbers and JSON key spans)
+  // still line up with `text`, but no original can be found inside an inserted alias.
+  const aliases = [...new Set(live.map(e => e.alias))].sort((a, b) => b.length - a.length);
+  const aliasRe = new RegExp(aliases.map(escapeRe).join('|'), 'g');
+  const searchable = text.replace(aliasRe, hit => '\u0000'.repeat(hit.length));
+  const lineStarts = [0];
+  for (let i = 0; i < text.length; i++) if (text[i] === '\n') lineStarts.push(i + 1);
+  const lineOf = (offset: number) => {
+    let lo = 0, hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (lineStarts[mid] <= offset) lo = mid; else hi = mid - 1;
+    }
+    return lo + 1;
+  };
+  /* One case-insensitive pass for all of them, longest first, like the replacer — one regex per
+     entry made this quadratic (10,000 entries × the whole text: a second for 2,000 events). */
+  const byLower = new Map<string, SanitiseEntry>();
+  for (const e of [...live].sort((x, y) => y.original.length - x.original.length)) {
+    if (!byLower.has(e.original.toLowerCase())) byLower.set(e.original.toLowerCase(), e);
+  }
+  const re = new RegExp(`(?<![A-Za-z0-9_])(?:${[...byLower.values()].map(e => escapeRe(e.original)).join('|')})(?![A-Za-z0-9_])`, 'gi');
+  const hits: ResidualHit[] = [];
+  const seen = new Set<string>();
+  for (const m of searchable.matchAll(re)) {
+    const start = m.index!;
+    const entry = byLower.get(m[0].toLowerCase())!;
+    if (keepsJsonKey(text, start, start + m[0].length, entry)) continue;
+    const line = lineOf(start);
+    const key = `${entry.original.toLowerCase()}\u0000${line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    hits.push({ kind: entry.kind, value: text.slice(start, start + m[0].length), line });
+    if (hits.length >= limit) break;
+  }
+  return hits.sort((a, b) => a.line - b.line);
+}
+
 // ---------------------------------------------------------------------------
 // Did we break the sample?
 // ---------------------------------------------------------------------------
@@ -2457,7 +2665,7 @@ export function checkStructurePreserved(before: string, after: string): Structur
           if (!firstBroken) firstBroken = `line ${i + 1} no longer parses${jsonBreakContext(x, y)}`;
           continue;
         }
-        if (jsonKeys(x) !== jsonKeys(y)) {
+        if (jsonKeyShape(x) !== jsonKeyShape(y)) {
           keysChanged++;
           if (!firstKeys) firstKeys = `line ${i + 1}: ${describeKeyChange(x, y)}`;
         }
@@ -2561,11 +2769,11 @@ function jsonOffenders(live: SanitiseEntry[], text: string): Set<string> {
     const after = applySanitisation(line, live);
     if (after === line) continue;
     // '' for a line that was not valid JSON to begin with — not ours to judge.
-    const keys = jsonKeys(line);
-    if (!keys || jsonKeys(after) === keys) continue;
+    const keys = jsonKeyShape(line);
+    if (!keys || jsonKeyShape(after) === keys) continue;
     for (const hit of new Set(line.match(m.re) || [])) {
-      const e = m.byValue.get(hit);
-      if (e && jsonKeys(applySanitisation(line, [e])) !== keys) out.add(`${e.kind}:${e.original}`);
+      const e = entryFor(m, hit);
+      if (e && jsonKeyShape(applySanitisation(line, [e])) !== keys) out.add(`${e.kind}:${e.original}`);
     }
     if (++examined >= JSON_PROBE_LINES) break;
   }
@@ -2613,12 +2821,25 @@ function countOf(s: string, ch: string): number {
   return n;
 }
 
-function jsonKeys(line: string): string {
+/* An email, IP or MAC literal as a whole key — the only keys the sanitiser may rewrite
+   (`KEYABLE_KINDS`). Shapes are loose on purpose: an alias such as `areyes@test` must still read
+   as a mailbox. */
+const ADDRESS_KEY = /^(?:[^@\s"]+(?:@|%40)[^@\s"]+|(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}|(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2})$/i;
+
+/**
+ * `jsonKeys` with every address-shaped key collapsed to one placeholder, so the save gate accepts
+ * `"jsmith@acme.com": 5` becoming `"areyes@test": 5` and still refuses any other renamed key.
+ */
+function jsonKeyShape(line: string): string {
+  return jsonKeys(line, k => (ADDRESS_KEY.test(k) ? '<address>' : k));
+}
+
+function jsonKeys(line: string, name: (key: string) => string = k => k): string {
   const keys: string[] = [];
   const walk = (v: unknown, path: string) => {
     if (!v || typeof v !== 'object') return;
     if (Array.isArray(v)) { v.forEach(item => walk(item, `${path}[]`)); return; }
-    for (const [k, val] of Object.entries(v)) { keys.push(`${path}.${k}`); walk(val, `${path}.${k}`); }
+    for (const [k, val] of Object.entries(v)) { const at = `${path}.${name(k)}`; keys.push(at); walk(val, at); }
   };
   try { walk(JSON.parse(line), ''); } catch { return ''; }
   return keys.sort().join(',');

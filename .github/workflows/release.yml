@@ -46,9 +46,16 @@ jobs:
           # app with a plain fetch, which brings in branches (and the tags that point
           # into them) only, so a commit reachable from the tag alone fails with
           # "reference is not a tree".
-          git push origin "HEAD:refs/heads/release" --force
-          git tag -f latest "${GITHUB_REF_NAME}"
-          git push origin latest --force
+          # Only a production tag moves what Git installs pull: a `-staging` rehearsal must not
+          # change `latest` or `release` for the orgs that installed from Git.
+          case "${GITHUB_REF_NAME}" in
+            *-staging) echo "Staging tag: latest and release stay where they are." ;;
+            *)
+              git push origin "HEAD:refs/heads/release" --force
+              git tag -f latest "${GITHUB_REF_NAME}"
+              git push origin latest --force
+              ;;
+          esac
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
