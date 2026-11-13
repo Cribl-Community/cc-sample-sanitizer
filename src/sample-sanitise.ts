@@ -170,6 +170,14 @@ export interface SanitiseOptions {
   parserName?: string;
   /** The detected sourcetype, used to look up precision hints. */
   sourcetype?: string;
+  /**
+   * Parsed identities the coverage proof would still find unchanged after this plan.
+   *
+   * Fed back by `planSampleSanitisation` after a dry run of its own plan, so anything the
+   * proof demands is already offered (and ticked) before the reviewer sees the list. The
+   * proof is the judge; this keeps detection from handing it a case it will refuse.
+   */
+  coverageGaps?: { field: string; value: string }[];
   /** Include the unticked shape-and-variance tier. Default true. */
   suggestSuspects?: boolean;
 }
@@ -530,7 +538,40 @@ const NEVER = new Set([
   'localhost', 'localhost.localdomain', 'example.com', 'example.net', 'example.org',
   'unknown', 'none', 'null', 'n/a', 'na', '-', 'system', 'root', 'admin',
   'administrator', 'guest', 'nobody', 'anonymous', 'local', 'default',
+  /* What a logger writes for "no value here": auditd's `hostname=?`, `tty=(none)`,
+     `acct="(unknown)"`. Offering these minted an alias for `?` and rewrote every one. */
+  '?', '??', '(none)', '(null)', '(unknown)', '<none>', '<unknown>', 'unset', 'undefined',
+  /* Numeric ids that mean root or "not set" rather than a person — `uid=0`, auditd's
+     unset `auid=4294967295`, `-1`. A hinted id field otherwise offered `0`, which would
+     have rewritten every `exit=0` and `gid=0` in the sample. */
+  '0', '-1', '4294967295', '65535',
 ]);
+
+/**
+ * The one way a parsed field value is read, shared by detection and the coverage proof.
+ *
+ * Quoting formats (auditd `acct="root"`, quoted KV and CEF extensions) hand the value back
+ * with its quotes. Detection stripped them and the proof did not, so the proof compared
+ * `"root"` against the never-replace list, missed, and blocked Apply on a value detection had
+ * deliberately left alone. Both sides normalise through here so they can never disagree.
+ */
+export function normaliseFieldValue(raw: string): string {
+  const v = raw.trim();
+  const m = /^(["'])([\s\S]*)\1$/.exec(v);
+  return (m ? m[2] : v).trim();
+}
+
+/**
+ * `.\\account` or `BUILTIN\\account` whose account part is structural (`.\\admin`). Nothing
+ * here names the customer, and detection never offers it, so the proof must not demand it.
+ */
+function isNeverAccount(value: string, isNever: (v: string) => boolean): boolean {
+  const m = /^([^\\]*)\\+([^\\]+)$/.exec(value);
+  if (!m) return false;
+  // Only a local or built-in domain: `CORP\\admin` still names the domain `CORP`.
+  const localDomain = m[1] === '' || m[1] === '.' || isNever(m[1]);
+  return localDomain && isNever(m[2]);
+}
 
 // ---------------------------------------------------------------------------
 // Per-source precision hints, and what the shipped corpus already publishes
@@ -1481,7 +1522,7 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
    */
   const readParsedLine = (fields: Record<string, string>, line: string) => {
     for (const [name, rawValue] of Object.entries(fields)) {
-      const value = rawValue.trim().replace(/^"(.*)"$/, '$1').trim();
+      const value = normaliseFieldValue(rawValue);
       if (!value || value.length > 120 || isNever(value)) continue;
       const hinted = hints.identityFields.has(name.toLowerCase());
       /* A distinguished name is an identity whatever the field is called: a certificate
@@ -1730,6 +1771,35 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
     found.set(trimmed, { original: trimmed, alias: '', kind: 'custom', count, via: 'your list', enabled: true, confidence: 'certain' });
   }
 
+  /* Whatever the coverage proof would still flag gets offered here, ticked. The usual cause
+     is a parsed-field value that the per-field pass handed to a text-wide pattern which then
+     did not take it. A value counted only inside the parsed field is still a real
+     occurrence, so a missing text hit just means it is not offered at all. */
+  for (const gap of opts.coverageGaps || []) {
+    const value = gap.value;
+    if (!value || !text.includes(value) || isStructural(value)) continue;
+    const existing = found.get(value);
+    if (existing?.enabled) continue;
+    const named = fieldIdentityKind(gap.field);
+    const kind: IdentityKind = IPV4_ONE.test(value) ? 'ipv4'
+      : FQDN_ONE.test(value) ? 'fqdn'
+      /* A plain token takes its field's minter; anything with inner punctuation is scrambled
+         by shape (`pii`) so slashes, arrows and separators stay where they were. */
+      : named && named !== 'ipv4' && named !== 'ipv6' && /^[\w.@-]+$/.test(value) ? named : 'pii';
+    const ipClass = kind === 'ipv4' ? classifyIpv4(value) ?? undefined : undefined;
+    if (existing) {
+      existing.enabled = true;
+      existing.confidence = 'certain';
+      existing.kind = kind;
+      existing.ipClass = ipClass;
+      existing.via = `parsed field “${gap.field}”`;
+    } else {
+      const count = text.split(value).length - 1;
+      found.set(value, { original: value, alias: '', kind, count, ipClass, via: `parsed field “${gap.field}”`, enabled: true, confidence: 'certain' });
+      tally.parser++;
+    }
+  }
+
   /* Pattern picks: one entry per distinct FULL match, alias rebuilt with only the chosen
      groups replaced. Applying the full match (not the bare group values) is what keeps
      `4212` inside `name[4212]:` from also rewriting ports and counters on the same line. */
@@ -1839,7 +1909,18 @@ export function planSanitisation(text: string, opts: SanitiseOptions = {}): Sani
     if (entry.via === PICKED_PATTERN_VIA) continue;
     const parts = value.split(/[^\w.$-]+/).filter(p => p.length > 2);
     const covered = parts.filter(p => found.has(p) && found.get(p) !== entry);
-    if (covered.length) found.delete(value);
+    if (!covered.length) continue;
+    /* Handing the whole over to its parts must not drop coverage. The parts are often
+       unticked suspects (`CLE2D01SP2` inside Zscaler's `suser=CLE2D01SP2/ZSCALER_INET1/…`),
+       so deleting a ticked whole left nothing ticked and the proof then blocked Apply. A
+       ticked whole ticks the parts that replace it. */
+    if (entry.enabled) {
+      for (const p of covered) {
+        const part = found.get(p)!;
+        if (!part.enabled) { part.enabled = true; part.confidence = 'certain'; }
+      }
+    }
+    found.delete(value);
   }
 
   /* Longest first, so replacing `web01.corp.local` happens before the bare `web01` it
@@ -2515,8 +2596,10 @@ export function proveIdentityCoverage(
     if (!fields) return;
     readable++;
     for (const [name, rawValue] of Object.entries(fields)) {
-      const value = rawValue.trim();
+      const value = normaliseFieldValue(rawValue);
       if (!value || value.length > 120 || isNever(value)) continue;
+      // Documentation names (`*.example`, `*.test`) are already safe; the FQDN pass skips them too.
+      if (RESERVED_DOMAIN.test(value)) continue;
       const kind = fieldIdentityKind(name);
       const hinted = hints.identityFields.has(name.toLowerCase());
       if (!kind && !hinted) continue;
@@ -2535,6 +2618,14 @@ export function proveIdentityCoverage(
       if (IPV4_ONE.test(value)) {
         const cls = classifyIpv4(value);
         if (!cls || cls === 'loopback' || cls === 'multicast' || cls === 'reserved') continue;
+      } else if (IPV6_ONE.test(value)) {
+        /* The same classes the IPv6 pattern deliberately leaves alone — `ff02::1:ff77:20d4`
+           (multicast) and `2001:db8:…` (documentation) are not identities, so the proof
+           must not demand they change. */
+        const cls = classifyIpv6(value);
+        if (!cls || cls === 'loopback' || cls === 'multicast' || cls === 'reserved') continue;
+      } else if (isNeverAccount(value, isNever)) {
+        continue;                                       // `.\admin`, `NT AUTHORITY\SYSTEM`
       } else if (/^[\d.]+$/.test(value) && !hinted) {
         continue;                                       // ports, counters, record ids
       }
@@ -2543,7 +2634,8 @@ export function proveIdentityCoverage(
       if (seen.has(key)) continue;
       seen.add(key);
       total++;
-      if (after[i]?.[name]?.trim() === value) remaining.push({ field: name, value, line: i + 1 });
+      const afterValue = after[i]?.[name];
+      if (afterValue != null && normaliseFieldValue(afterValue) === value) remaining.push({ field: name, value, line: i + 1 });
       else replaced++;
     }
   });

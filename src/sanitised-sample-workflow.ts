@@ -343,12 +343,38 @@ export function planSampleSanitisation(
   options: Omit<SanitiseOptions, 'parsed' | 'parserName' | 'sourcetype'> = {},
 ): SanitisePlan {
   const local = parseSampleLocally(events, sourcetype);
-  return planSanitisation(events, {
+  const canonical = canonicalizeSourcetype(sourcetype);
+  const planOpts: SanitiseOptions = {
     ...options,
     parsed: local.parsed,
     parserName: local.parserName,
-    sourcetype: canonicalizeSourcetype(sourcetype),
-  });
+    sourcetype: canonical,
+  };
+  const plan = planSanitisation(events, planOpts);
+  /* Detection owns the offer; the coverage proof at Apply only confirms it. Dry-run the plan
+     through the very proof Apply runs, and anything that would still show through is a
+     detection miss — offer it now, ticked, instead of letting Apply refuse a plan the
+     reviewer never changed. After this, the survivor blocker fires only for a row the
+     reviewer unticked or edited. */
+  const gaps = coverageGaps(events, sourcetype, local.parsed, plan.entries);
+  if (!gaps.length) return plan;
+  return planSanitisation(events, { ...planOpts, coverageGaps: gaps });
+}
+
+/** Parsed identities that `plan` would leave unchanged, as the Apply-time proof sees them. */
+function coverageGaps(
+  events: string,
+  sourcetype: string,
+  parsedBefore: ParsedLine[],
+  entries: SanitiseEntry[],
+): { field: string; value: string }[] {
+  if (!parsedBefore.some(Boolean)) return [];
+  const after = parseSampleLocally(applySanitisation(events, entries), sourcetype);
+  const proof = proveIdentityCoverage(parsedBefore, after.parsed, { sourcetype: canonicalizeSourcetype(sourcetype) });
+  const seen = new Set<string>();
+  return proof.remaining
+    .filter(r => !seen.has(r.value) && seen.add(r.value))
+    .map(r => ({ field: r.field, value: r.value }));
 }
 
 export interface AppliedSanitisation {
